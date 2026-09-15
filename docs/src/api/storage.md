@@ -20,7 +20,7 @@ SparseLRUArray{Float64}((i, j) -> Float64(i) + j; ndims=2, capacity=512,
 Storage options: `:dict`, `:msbtree`, `:lsbtree`.
 `AxisExtent` describes each dimension's inclusive bounds, independently of storage.
 
-## [Dense array](@id dense)
+## [Array](@id array)
 
 Pass an integer shape, such as `(100, 100)`. Allocate one reference slot per position and generate values
 only when requested. This gives direct lookup for fixed domains whose reference map fits in memory.

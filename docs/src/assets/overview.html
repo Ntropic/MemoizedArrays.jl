@@ -15,7 +15,7 @@ flowchart LR
     A --> S["Storage"]
     C --> U["Unbounded · JITArray"]
     C --> B["Bounded · LRUArray"]
-    S --> D["Dense array"]
+    S --> D["Array"]
     S --> H["Dictionary"]
     S --> M["MSB tree · high bits first"]
     S --> L["LSB tree · low bits first"]
@@ -24,7 +24,7 @@ flowchart LR
     click S "../api/storage.html" "Storage choices" _parent
     click U "../api/caches.html#unbounded" "Keep generated values" _parent
     click B "../api/caches.html#bounded" "Limit resident values" _parent
-    click D "../api/storage.html#dense" "Fixed integer shape" _parent
+    click D "../api/storage.html#array" "Fixed integer shape" _parent
     click H "../api/storage.html#dictionary" "Sparse coordinate lookup" _parent
     click M "../api/storage.html#msb-tree" "MSB = most significant bit: highest binary place values first" _parent
     click L "../api/storage.html#lsb-tree" "LSB = least significant bit: lowest binary place values first" _parent

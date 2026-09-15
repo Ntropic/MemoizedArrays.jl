@@ -19,7 +19,7 @@ Sparse coordinates are `(2mod(i,32), 2div(i,32))`, `i=1:512`: a small region wit
 position. Eviction requests shift the first coordinate by 128. This replaces the previous widely
 scattered workload. All sparse maps declare the same full signed coordinate domain.
 
-**Dense storage**
+**Array storage**
 
 | Cache | Read | 4-thread read | Generate | Generate + evict |
 |---|---:|---:|---:|---:|

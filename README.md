@@ -1,6 +1,6 @@
 # JITArrays.jl
 
-**Generate once, reuse through array indexing.** Unbounded or LRU caching, dense or sparse storage,
+**Generate once, reuse through array indexing.** Unbounded or LRU caching, array or sparse storage,
 shared generation across tasks. Julia 1.12+.
 
 ```julia

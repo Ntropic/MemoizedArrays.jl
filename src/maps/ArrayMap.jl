@@ -1,5 +1,5 @@
 # Allocate and initialize an atomic reference map for either cache.
-function _empty_map(::Type{T}, shape, empty=_EMPTY) where T
+function empty_map(::Type{T}, shape, empty=_EMPTY) where T
     count = 1
     for dimension in shape
         if dimension < 0
@@ -14,13 +14,13 @@ function _empty_map(::Type{T}, shape, empty=_EMPTY) where T
     return map
 end
 
-# Dense slots use the same publication operations as dictionary records and tree nodes.
-@inline _slot_entry(slot::AtomicMemoryRef) = Core.memoryrefget(slot, :acquire, false)
-@inline _slot_publish!(slot::AtomicMemoryRef, value) = Core.memoryrefset!(slot, value, :release, false)
-@inline _slot_claim!(slot::AtomicMemoryRef, empty, entry) =
+# Array slots use the same publication operations as dictionary records and tree nodes.
+@inline slot_entry(slot::AtomicMemoryRef) = Core.memoryrefget(slot, :acquire, false)
+@inline slot_publish!(slot::AtomicMemoryRef, value) = Core.memoryrefset!(slot, value, :release, false)
+@inline slot_claim!(slot::AtomicMemoryRef, empty, entry) =
     Core.memoryrefreplace!(slot, empty, entry, :acquire_release, :acquire, false)
-@inline _store_hash(::AtomicMemory, key) = nothing
-@inline _store_lookup(map::AtomicMemory, key::Int, routing) = @inbounds memoryref(map, key)
-@inline _store_reserve!(map::AtomicMemory, key, routing, mode=Val(true)) = _store_lookup(map, key, routing)
-_store_retain!(::AtomicMemory, slot) = nothing
-@inline _store_delete!(::AtomicMemory, key, slot) = _slot_publish!(slot, _EMPTY)
+@inline store_hash(::AtomicMemory, key) = nothing
+@inline store_lookup(map::AtomicMemory, key::Int, routing) = @inbounds memoryref(map, key)
+@inline store_reserve!(map::AtomicMemory, key, routing, mode=Val(true)) = store_lookup(map, key, routing)
+store_retain!(::AtomicMemory, slot) = nothing
+@inline store_delete!(::AtomicMemory, key, slot) = slot_publish!(slot, _EMPTY)

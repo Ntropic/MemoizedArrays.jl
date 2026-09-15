@@ -48,7 +48,7 @@ end
         entry, previous = cache.oldest, nothing
         while entry !== nothing && length(actual) <= cache.capacity
             @test entry.previous === previous
-            @test JITArrays._entry(cache, entry.key) === entry
+            @test JITArrays.entry(cache, entry.key) === entry
             push!(actual, entry.key)
             previous, entry = entry, entry.next
         end
@@ -92,7 +92,7 @@ end
     end)
     owner = Threads.@spawn cache[1]
     take!(started)
-    pending = JITArrays._entry(cache, 1)
+    pending = JITArrays.entry(cache, 1)
     followers = [@async cache[1] for _ in 1:4]
     @test timedwait(() -> all(istaskstarted, followers), 5) == :ok
     @test timedwait(() -> (@atomic :acquire pending.state) isa Threads.Condition, 5) == :ok
@@ -108,7 +108,7 @@ end
         @test all(result -> result == value, fetch.(followers))
         @test fetch(other) == fill(2, 2, 2)
         @test cache[3] == fill(3, 2, 2)
-        @test JITArrays._wait_entry(pending) === value
+        @test JITArrays.wait_entry(pending) === value
         @test cache.count == 1
     end
 end
@@ -128,8 +128,8 @@ end
     end)
     owner = Threads.@spawn try cache[1] catch exception; exception end
     take!(started)
-    pending = JITArrays._entry(cache, 1)
-    follower = Threads.@spawn JITArrays._wait_entry(pending)
+    pending = JITArrays.entry(cache, 1)
+    follower = Threads.@spawn JITArrays.wait_entry(pending)
     @test timedwait(() -> (@atomic :acquire pending.state) isa Threads.Condition, 5) == :ok
     other = Threads.@spawn cache[2]
     put!(release, nothing)
@@ -140,7 +140,7 @@ end
         @test_throws TaskFailedException fetch(follower)
         @test fetch(other) == 2
         @test cache[1] == 1
-        @test_throws ErrorException JITArrays._wait_entry(pending)
+        @test_throws ErrorException JITArrays.wait_entry(pending)
         @test cache.count == 1
     end
     invalid = ExactLRUArray{Int}((1,), 1, _ -> 0.5)
@@ -178,8 +178,8 @@ end
     @test cache.count == count(i -> isready(cache, i), 1:8) == 3
 end
 
-function _test_astuple(::Val{N}, controls, indexes) where {N}
-    _as_tuple = nothing
+function test_astuple(::Val{N}, controls, indexes) where {N}
+    as_tuple = nothing
     Val = nothing
     JITArrays.@astuple N controls indexes
     return controls, indexes
@@ -189,19 +189,19 @@ end
     @test (1.0, 2.0) isa JITArrays.VT{2,Float64}
     @test [1.0, 2.0] isa JITArrays.VT{2,Float64}
     @test !((1.0,) isa JITArrays.VT{2,Float64})
-    @test (@inferred JITArrays._as_tuple((1.0, 2.0), Val(2))) === (1.0, 2.0)
-    @test (@inferred JITArrays._as_tuple([1.0, 2.0], Val(2))) === (1.0, 2.0)
-    @test JITArrays._as_tuple(view([1.0, 2.0, 3.0], 2:3), Val(2)) === (2.0, 3.0)
-    @test_throws DimensionMismatch JITArrays._as_tuple([1.0], Val(2))
-    @test_throws MethodError JITArrays._as_tuple((1.0,), Val(2))
-    @test (@inferred _test_astuple(Val(2), [1.0, 2.0], [3, 4])) === ((1.0, 2.0), (3, 4))
-    @test (@inferred _test_astuple(Val(2), (1.0, 2.0), (3, 4))) === ((1.0, 2.0), (3, 4))
-    @test_throws DimensionMismatch _test_astuple(Val(2), [1.0], [3, 4])
-    @test_throws MethodError _test_astuple(Val(2), (1.0,), (3, 4))
+    @test (@inferred JITArrays.as_tuple((1.0, 2.0), Val(2))) === (1.0, 2.0)
+    @test (@inferred JITArrays.as_tuple([1.0, 2.0], Val(2))) === (1.0, 2.0)
+    @test JITArrays.as_tuple(view([1.0, 2.0, 3.0], 2:3), Val(2)) === (2.0, 3.0)
+    @test_throws DimensionMismatch JITArrays.as_tuple([1.0], Val(2))
+    @test_throws MethodError JITArrays.as_tuple((1.0,), Val(2))
+    @test (@inferred test_astuple(Val(2), [1.0, 2.0], [3, 4])) === ((1.0, 2.0), (3, 4))
+    @test (@inferred test_astuple(Val(2), (1.0, 2.0), (3, 4))) === ((1.0, 2.0), (3, 4))
+    @test_throws DimensionMismatch test_astuple(Val(2), [1.0], [3, 4])
+    @test_throws MethodError test_astuple(Val(2), (1.0,), (3, 4))
 end
 
 
-function _read_ready_cache_values(cache, expected)
+function read_ready_cache_values(cache, expected)
     for _ in 1:64
         for index in eachindex(expected)
             if cache[index] !== expected[index]
@@ -212,12 +212,12 @@ function _read_ready_cache_values(cache, expected)
     return nothing
 end
 
-function _ready_cache_allocations(cache, expected)
-    _read_ready_cache_values(cache, expected)
-    return @allocated _read_ready_cache_values(cache, expected)
+function ready_cache_allocations(cache, expected)
+    read_ready_cache_values(cache, expected)
+    return @allocated read_ready_cache_values(cache, expected)
 end
 
-function _read_ready_get_values(cache, expected)
+function read_ready_get_values(cache, expected)
     for _ in 1:64
         for index in eachindex(expected)
             if get(cache, index, nothing) !== expected[index]
@@ -228,9 +228,9 @@ function _read_ready_get_values(cache, expected)
     return nothing
 end
 
-function _ready_get_allocations(cache, expected)
-    _read_ready_get_values(cache, expected)
-    return @allocated _read_ready_get_values(cache, expected)
+function ready_get_allocations(cache, expected)
+    read_ready_get_values(cache, expected)
+    return @allocated read_ready_get_values(cache, expected)
 end
 
 @testset "Indexed access and key forms" begin
@@ -288,8 +288,8 @@ end
     values = [fill(k, 2, 2) for k in 1:6]
     cache = JITArray{Matrix{Int}}((2, 3), (i, j) -> values[i + 2(j - 1)])
     @test fetch(generate!(cache, 1:6)) === cache
-    @test _ready_cache_allocations(cache, values) == 0
-    @test _ready_get_allocations(cache, values) == 0
+    @test ready_cache_allocations(cache, values) == 0
+    @test ready_get_allocations(cache, values) == 0
 end
 
 @testset "Batch generation" begin
@@ -488,7 +488,7 @@ end
         @test all(exception -> exception isa ErrorException && exception !== failure, fetch.(followers))
         @test calls[] == 2 && cache[1] === result
         late = try
-            JITArrays._wait_entry(first_attempt)
+            JITArrays.wait_entry(first_attempt)
         catch exception
             exception
         end
@@ -509,8 +509,8 @@ end
         attempt = @atomic :acquire cache.map[1]
         put!(release, nothing)
         @test fetch(owner) === result
-        @test JITArrays._wait_entry(attempt) === result
-        @test JITArrays._entry(cache, 1) === attempt
+        @test JITArrays.wait_entry(attempt) === result
+        @test JITArrays.entry(cache, 1) === attempt
         @test attempt.value === result
     end
 end
@@ -521,8 +521,8 @@ end
         generator = i -> expected[i]
         for cache in (JITArray{ValueType}((3,), generator), ExactLRUArray{ValueType}((3,), 3, generator))
             @test all(i -> cache[i] === expected[i], eachindex(expected))
-            @test _ready_cache_allocations(cache, expected) == 0
-            @test _ready_get_allocations(cache, expected) == 0
+            @test ready_cache_allocations(cache, expected) == 0
+            @test ready_get_allocations(cache, expected) == 0
         end
     end
 end
@@ -535,7 +535,7 @@ end
         @test fieldnames(typeof(cache)) == (:map, :domain, :generator)
         @test !hasfield(typeof(cache), :available)
         @test all(name -> isconst(typeof(cache), name), (:map, :domain, :generator))
-        @test JITArrays._entrytype(cache) === JITArrays.Entry{Int}
+        @test JITArrays.entrytype(cache) === JITArrays.Entry{Int}
         @test length(cache.map) == prod(shape)
     end
     cache = JITArray{Int}([2, 3], (i, j) -> Float64(10i + j))
@@ -635,33 +635,33 @@ end
         output = copy(selected)
         keys = [4, 5, 7, 8]
         @test all(output[i] === values[keys[i]] for i in eachindex(output))
-        stamps = [(@atomic :monotonic JITArrays._entry(cache, key).accessed) for key in keys]
+        stamps = [(@atomic :monotonic JITArrays.entry(cache, key).accessed) for key in keys]
         @test all(==(first(stamps)), stamps)
         if option === :lossy
-            @test JITArrays._clock_now(cache.clock) == 4
+            @test JITArrays.clock_now(cache.clock) == 4
         end
         flat = view(cache, 2:5)
         @test copy(flat) == values[2:5]
         if option === :lossy
-            @test JITArrays._clock_now(cache.clock) == 8
+            @test JITArrays.clock_now(cache.clock) == 8
         end
         dest = Matrix{Matrix{Int}}(undef, 3, 2)
         copyto!(view(dest, 1:2, :), selected)
         @test dest[1:2, :] == output
-        stamps = [(@atomic :monotonic JITArrays._entry(cache, key).accessed) for key in keys]
+        stamps = [(@atomic :monotonic JITArrays.entry(cache, key).accessed) for key in keys]
         @test all(==(first(stamps)), stamps)
-        before = JITArrays._clock_now(cache.clock)
+        before = JITArrays.clock_now(cache.clock)
         @test isempty(cache[Int[]])
         @test fetch(generate!(cache, Int[])) === cache
         @test_throws BoundsError copyto!(Matrix{Int}[], selected)
         if option === :lossy
-            @test JITArrays._clock_now(cache.clock) == before
+            @test JITArrays.clock_now(cache.clock) == before
         end
         @test fetch(generate!(cache, ((1, 1), (2, 2), (1, 1)))) === cache
-        @test (@atomic :monotonic JITArrays._entry(cache, 1).accessed) ==
-            (@atomic :monotonic JITArrays._entry(cache, 5).accessed)
+        @test (@atomic :monotonic JITArrays.entry(cache, 1).accessed) ==
+            (@atomic :monotonic JITArrays.entry(cache, 5).accessed)
         if option === :lossy
-            @test JITArrays._clock_now(cache.clock) == before + 3
+            @test JITArrays.clock_now(cache.clock) == before + 3
         end
         @test cache[1] === values[1]
     end
@@ -673,7 +673,7 @@ end
     retained = small[:]
     @test [v[1] for v in retained] == collect(1:6)
     @test small.ready == 1
-    @test JITArrays._clock_now(small.clock) == 6
+    @test JITArrays.clock_now(small.clock) == 6
     tasks = [Threads.@spawn small[1:6] for _ in 1:4]
     @test timedwait(() -> all(istaskdone, tasks), 10) == :ok
     @test all(task -> [v[1] for v in fetch(task)] == collect(1:6), tasks)
@@ -693,25 +693,25 @@ include("SparseJITArrays_test.jl")
             end
             fill(Float64(i), 2, 2)
         end)
-        empty = JITArrays._entry(cache, 1)
+        empty = JITArrays.entry(cache, 1)
         @test length(Base.uniontypes(eltype(cache.map))) == 2
-        @test JITArrays._entry(cache, 2) === empty
+        @test JITArrays.entry(cache, 2) === empty
         @test_throws ErrorException cache[1]
-        @test JITArrays._entry(cache, 1) === empty
+        @test JITArrays.entry(cache, 1) === empty
         @test cache[1] == fill(1.0, 2, 2)
         @test cache[2] == fill(2.0, 2, 2)
-        @test JITArrays._entry(cache, 3) === empty
+        @test JITArrays.entry(cache, 3) === empty
         @test empty isa JITArrays.Empty
         @test fieldcount(typeof(empty)) == 0
         if cache isa LRUArray
-            @test JITArrays._entry(cache, 1) === empty
+            @test JITArrays.entry(cache, 1) === empty
             @test cache[1] == fill(1.0, 2, 2)
         end
     end
 end
 
 function combination_cache(::Type{V}, storage, policy, generator; capacity=3) where V
-    if storage === :dense
+    if storage === :array
         if policy === :none
             return JITArray{V}((6,), generator)
         end
@@ -722,7 +722,7 @@ end
 
 @testset "Twelve combinations share typed entries and completion identity" begin
     containers = Set{Symbol}()
-    for storage in (:dense, :dict, :msbtree, :lsbtree), policy in (:none, :exact, :sampled)
+    for storage in (:array, :dict, :msbtree, :lsbtree), policy in (:none, :exact, :sampled)
         started, release = Channel{Nothing}(1), Channel{Nothing}(1)
         calls = Threads.Atomic{Int}(0)
         expected = fill(7, 2, 2)
@@ -735,9 +735,9 @@ end
             expected
         end; capacity=1)
         push!(containers, nameof(typeof(cache)))
-        key = storage === :dense ? 1 : (1,)
-        E = JA._entrytype(cache)
-        maptype = storage === :dense ? AtomicMemory : storage === :dict ? JA.DictMap :
+        key = storage === :array ? 1 : (1,)
+        E = JA.entrytype(cache)
+        maptype = storage === :array ? AtomicMemory : storage === :dict ? JA.DictMap :
             storage === :msbtree ? JA.MSBRadixMap : JA.LSBRadixMap
         @test cache.map isa maptype
         slot_type = cache.map isa AtomicMemory ? eltype(cache.map) : typeof(cache.map).parameters[1]
@@ -746,10 +746,10 @@ end
         @test all(name -> isconcretetype(fieldtype(typeof(cache), name)), (:map, :domain, :generator))
         @test all(name -> isconst(typeof(cache), name), (:map, :domain, :generator))
         @test !hasfield(typeof(cache), :policy)
-        @test JA._entry(cache, key) isa JA.Empty
+        @test JA.entry(cache, key) isa JA.Empty
         owner = Threads.@spawn cache[1]
         take!(started)
-        entry = JA._entry(cache, key)
+        entry = JA.entry(cache, key)
         @test entry isa E
         @test !isready(cache, 1)
         if policy === :exact
@@ -768,10 +768,10 @@ end
         @test fetch(owner) === expected
         @test all(task -> fetch(task) === expected, followers)
         @test calls[] == 1
-        @test JA._entry(cache, key) === entry
+        @test JA.entry(cache, key) === entry
         @test entry.value === expected
         @test (@atomic :acquire entry.state) === true
-        @test JA._wait_entry(entry) === expected
+        @test JA.wait_entry(entry) === expected
         if policy === :exact
             @test cache.oldest === cache.newest === entry
         elseif policy === :sampled
@@ -780,8 +780,8 @@ end
         end
         cache[2]
         if policy !== :none
-            @test JA._entry(cache, key) isa JA.Empty
-            @test JA._wait_entry(entry) === expected
+            @test JA.entry(cache, key) isa JA.Empty
+            @test JA.wait_entry(entry) === expected
             if policy === :exact
                 @test entry.previous === entry.next === nothing
             else
@@ -792,8 +792,8 @@ end
         broad = combination_cache(Any, storage, policy, i -> values[i])
         for i in eachindex(values)
             @test broad[i] === values[i]
-            stored = JA._entry(broad, storage === :dense ? i : (i,))
-            @test stored isa JA._entrytype(broad)
+            stored = JA.entry(broad, storage === :array ? i : (i,))
+            @test stored isa JA.entrytype(broad)
             @test stored.value === values[i]
             @test (@atomic :acquire stored.state) === true
         end

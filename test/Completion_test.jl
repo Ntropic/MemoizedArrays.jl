@@ -11,7 +11,7 @@
         end)
         # An unsupported stamp fails sampled insertion before its bookkeeping changes.
         owner = @async try
-            JITArrays._cache_get(cache, 1, stamp)
+            JITArrays.cache_get(cache, 1, stamp)
         catch exception
             exception
         end
@@ -22,7 +22,7 @@
             continue
         end
         take!(started)
-        entry = JITArrays._entry(cache, 1)
+        entry = JITArrays.entry(cache, 1)
         follower = @async try
             cache[1]
         catch exception
@@ -68,7 +68,7 @@
             end
         finally
             unlock(condition)
-            JITArrays._notify_waiters(condition)
+            JITArrays.notify_waiters(condition)
         end
         completed = timedwait(() -> all(istaskdone, (owner, follower)), 5)
         @test completed == :ok

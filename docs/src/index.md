@@ -7,7 +7,7 @@ objects. Concurrent callers share generation; reading a cached entry allocates n
 Keep every generated value, or set a capacity and let the cache evict old entries.
 
 Use standard indexing, slices, and lazy views, with asynchronous generation for batches.
-Dense storage suits fixed shapes; sparse storage supports huge signed coordinate domains without
+Array storage suits fixed shapes; sparse storage supports huge signed coordinate domains without
 allocating every position. Requires Julia 1.12 or later.
 
 ## Choose cache and storage

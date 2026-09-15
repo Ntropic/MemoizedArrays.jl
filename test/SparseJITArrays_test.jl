@@ -11,8 +11,8 @@ function sparse_cache(::Type{V}, ranges, generator, storage, policy=:none; capac
     return LRUArray{V}(ranges, capacity, generator; policy, options...)
 end
 
-sparse_slot(cache, key) = JA._store_lookup(cache.map, key, JA._store_hash(cache.map, key))
-sparse_pending(cache, key) = JA._slot_entry(sparse_slot(cache, key))
+sparse_slot(cache, key) = JA.store_lookup(cache.map, key, JA.store_hash(cache.map, key))
+sparse_pending(cache, key) = JA.slot_entry(sparse_slot(cache, key))
 sparse_signal(pending) = pending
 
 function sparse_waiter_count(signal)
@@ -172,17 +172,17 @@ end
         @test copyto!(dest, v) === dest
         @test dest == [i + 10j for i in -2:2, j in -1:1]
         if policy === :sampled
-            before = JA._clock_now(cache.clock)
+            before = JA.clock_now(cache.clock)
             cache[-1:1, -1:1]
-            @test JA._clock_now(cache.clock) == before + 9
-            before = JA._clock_now(cache.clock)
+            @test JA.clock_now(cache.clock) == before + 9
+            before = JA.clock_now(cache.clock)
             copy(v)
-            @test JA._clock_now(cache.clock) == before + 15
-            before = JA._clock_now(cache.clock)
+            @test JA.clock_now(cache.clock) == before + 15
+            before = JA.clock_now(cache.clock)
             fetch(generate!(cache, ((0,0),(0,0),(1,1))))
-            @test JA._clock_now(cache.clock) == before + 3
+            @test JA.clock_now(cache.clock) == before + 3
             @test !isready(cache, 4, 3)
-            @test JA._clock_now(cache.clock) == before + 3
+            @test JA.clock_now(cache.clock) == before + 3
         end
     end
 end
@@ -270,7 +270,7 @@ end
             actual, entry, previous = Int[], cache.oldest, nothing
             while entry !== nothing && length(actual) <= cache.capacity
                 @test entry.previous === previous
-                @test JA._entry(cache, entry.key) === entry
+                @test JA.entry(cache, entry.key) === entry
                 push!(actual, entry.key[1])
                 previous, entry = entry, entry.next
             end
@@ -315,11 +315,11 @@ end
             value = fetch(owner)
             @test all(task -> fetch(task) === value, followers)
             if policy === :none
-                JA._wait_entry(pending)
+                JA.wait_entry(pending)
                 @test cache[-1] === value
             else
                 @test fetch(other) == [2]
-                @test JA._wait_entry(pending) === value
+                @test JA.wait_entry(pending) === value
             end
         end
     end
@@ -360,7 +360,7 @@ end
             end
             @test cache[-5] == -5
             @test calls[] == 2
-            @test_throws ErrorException JA._wait_entry(signal)
+            @test_throws ErrorException JA.wait_entry(signal)
         end
     end
 end

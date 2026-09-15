@@ -142,7 +142,7 @@ function waiter_round(make)
     end)
     owner = Threads.@spawn cache[1]
     take!(started)
-    entry = JITArrays._entry(cache, 1)
+    entry = JITArrays.entry(cache, 1)
     waiters = [Threads.@spawn cache[1] for _ in 1:3]
     registered = timedwait(5) do
         state = @atomic :acquire entry.state
