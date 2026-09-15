@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<title>JITArrays cache and storage choices</title>
+<style>
+    body { margin: 0; }
+    .mermaid { text-align: center; }
+    .mermaid a { cursor: pointer; }
+    .mermaid a foreignObject { pointer-events: none; }
+    .mermaid a .nodeLabel { color: #0969da !important; text-decoration: underline; }
+</style>
+<div class="mermaid">
+flowchart LR
+    A["JITArrays"] --> C["Cache"]
+    A --> S["Storage"]
+    C --> U["Unbounded · JITArray"]
+    C --> B["Bounded · LRUArray"]
+    S --> D["Dense array"]
+    S --> H["Dictionary"]
+    S --> M["MSB tree · high bits first"]
+    S --> L["LSB tree · low bits first"]
+    click A "../api.html" "API reference" _parent
+    click C "../api/caches.html" "Cache choices" _parent
+    click S "../api/storage.html" "Storage choices" _parent
+    click U "../api/caches.html#unbounded" "Keep generated values" _parent
+    click B "../api/caches.html#bounded" "Limit resident values" _parent
+    click D "../api/storage.html#dense" "Fixed integer shape" _parent
+    click H "../api/storage.html#dictionary" "Sparse coordinate lookup" _parent
+    click M "../api/storage.html#msb-tree" "MSB = most significant bit: highest binary place values first" _parent
+    click L "../api/storage.html#lsb-tree" "LSB = least significant bit: lowest binary place values first" _parent
+</div>
+<script type="module">
+    import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+    mermaid.initialize({startOnLoad: false, securityLevel: "loose", theme: "neutral",
+        flowchart: {nodeSpacing: 16, rankSpacing: 30}});
+    await mermaid.run({querySelector: ".mermaid"});
+</script>
+</html>

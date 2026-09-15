@@ -1,0 +1,13 @@
+name = "JITArrays"
+uuid = "137b8a29-ca25-4068-8d2b-8b6b6dd43d69"
+authors = ["Michael Schilling"]
+version = "0.1.0"
+
+[compat]
+julia = "1.12"
+
+[extras]
+Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+
+[targets]
+test = ["Test"]
