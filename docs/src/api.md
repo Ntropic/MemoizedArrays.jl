@@ -8,9 +8,9 @@ CurrentModule = JITArrays
 
 | API | Contents |
 |---|---|
-| [Caches](api/caches.md) | Unbounded retention, bounded LRU, and recency clocks |
+| [Caches](api/caches.md) | Unbounded retention, bounded LRU, and access counters |
 | [Storage](api/storage.md) | Arrays, dictionaries, and the two tree backends |
-| [Array interface](api/interface.md) | Shared array behavior and asynchronous batches |
+| [Array interface](api/interface.md) | Shared array behavior and synchronous batches |
 
 ```@docs
 AbstractJITArray

@@ -27,8 +27,8 @@ julia> v[1, 1]
 (-2, 0)
 ```
 
-Concurrent requests for one missing entry share generation and return the same value. Failed attempts
-propagate their error to waiting callers; later requests can retry.
+Generation runs in the calling task. Generator exceptions propagate directly, with no cleanup or
+recovery guarantee. Batched `generate!` runs in request order and returns the cache directly.
 
 ```@docs
 isready
@@ -36,6 +36,6 @@ generate!
 ```
 
 Keep batch requests unchanged until completion. A bounded cache may evict earlier batch results before
-the batch finishes. Sampled-cache bulk selections and generation batches share one timestamp; the lossy
+the batch finishes. Sampled-cache bulk selections and generation batches share one timestamp; the access
 counter advances once by the number of requests, including repeated keys. Individual view reads update
 recency separately.

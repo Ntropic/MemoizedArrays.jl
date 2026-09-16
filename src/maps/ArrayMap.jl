@@ -1,5 +1,14 @@
-# Allocate and initialize an atomic reference map for either cache.
-function empty_map(::Type{T}, shape, empty=_EMPTY) where T
+# Array storage: fixed slots with direct reads, writes and resets.
+# Slot addresses survive eviction; capacity and recency belong to the cache.
+
+struct ArrayMap{T}
+    slots::Memory{T}
+end
+
+ArrayMap(::Type{T}, shape) where T = ArrayMap(empty_map(T, shape))
+
+# Allocate and initialize slots for maps and tree blocks.
+function empty_map(::Type{T}, shape, empty=EMPTY) where T
     count = 1
     for dimension in shape
         if dimension < 0
@@ -7,20 +16,23 @@ function empty_map(::Type{T}, shape, empty=_EMPTY) where T
         end
         count = Base.checked_mul(count, dimension)
     end
-    map = AtomicMemory{T}(undef, count)
+    map = Memory{T}(undef, count)
     for address in eachindex(map)
-        @atomic :release map[address] = empty
+        map[address] = empty
     end
     return map
 end
 
-# Array slots use the same publication operations as dictionary records and tree nodes.
-@inline slot_entry(slot::AtomicMemoryRef) = Core.memoryrefget(slot, :acquire, false)
-@inline slot_publish!(slot::AtomicMemoryRef, value) = Core.memoryrefset!(slot, value, :release, false)
-@inline slot_claim!(slot::AtomicMemoryRef, empty, entry) =
-    Core.memoryrefreplace!(slot, empty, entry, :acquire_release, :acquire, false)
-@inline store_hash(::AtomicMemory, key) = nothing
-@inline store_lookup(map::AtomicMemory, key::Int, routing) = @inbounds memoryref(map, key)
-@inline store_reserve!(map::AtomicMemory, key, routing, mode=Val(true)) = store_lookup(map, key, routing)
-store_retain!(::AtomicMemory, slot) = nothing
-@inline store_delete!(::AtomicMemory, key, slot) = slot_publish!(slot, _EMPTY)
+# Slot references share read/write operations with dictionary records and tree nodes.
+@inline slot_entry(slot::MemoryRef) = @inbounds slot[]
+@inline slot_publish!(slot::MemoryRef, value) = (@inbounds slot[] = value)
+@inline store_hash(::ArrayMap, key) = nothing
+@inline store_lookup(map::ArrayMap, key::Int, routing) = @inbounds memoryref(map.slots, key)
+@inline store_reserve!(map::ArrayMap, key, routing) = store_lookup(map, key, routing)
+@inline prepare(map, key, routing) = (store_lookup(map, key, routing), nothing)
+@inline preparedentry(slot, hint) = slot_entry(slot)
+@inline reserve!(map::ArrayMap, key, routing, slot, hint) = slot
+store_retain!(::ArrayMap, slot) = nothing
+@inline store_delete!(::ArrayMap, key, slot) = slot_publish!(slot, EMPTY)
+
+@inline delete_key!(map::ArrayMap, key) = (@inbounds map.slots[key] = EMPTY)

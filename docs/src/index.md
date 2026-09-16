@@ -3,10 +3,11 @@
 **Generate on demand. Reuse through ordinary array indexing.**
 
 JITArrays caches expensive, index-dependent computations in memory: scalars, matrices, or other Julia
-objects. Concurrent callers share generation; reading a cached entry allocates no memory.
+objects. Generation is synchronous; reading a cached entry allocates no memory.
+This version has no concurrency handling and does not support concurrent access to the same cache.
 Keep every generated value, or set a capacity and let the cache evict old entries.
 
-Use standard indexing, slices, and lazy views, with asynchronous generation for batches.
+Use standard indexing, slices, and lazy views, with synchronous generation for batches.
 Array storage suits fixed shapes; sparse storage supports huge signed coordinate domains without
 allocating every position. Requires Julia 1.12 or later.
 
@@ -50,16 +51,14 @@ julia> isready(a, 2)
 false
 ```
 
-### Generate sparse coordinates in the background
+### Generate a batch of sparse coordinates
 
 ```jldoctest
 julia> using JITArrays
 
 julia> a = JITArray{Tuple{Int,Int}}(tuple, typemin(Int):typemax(Int), -100:100);
 
-julia> job = generate!(a, ((-20, 3), (50, -1)));
-
-julia> fetch(job) === a
+julia> generate!(a, ((-20, 3), (50, -1))) === a
 true
 
 julia> a[-20, 3]

@@ -35,11 +35,14 @@ as entries are requested. Suitable for scattered accesses over large domains.
 Use `storage=:msbtree` with `block_shape`. Start with the coordinate bits with the
 highest binary place values, refining toward the requested entry. Allocate only touched branches and entry blocks.
 
-## [Least significant bit (LSB) tree](@id lsb-tree)
+## [Trees by coordinate depth](@id lsb-tree)
 
-Use `storage=:lsbtree` with `block_shape`. Start with the coordinate bits with the
-lowest binary place values: small coordinates have shallow paths, while larger coordinates need more levels. Distant
-insertions do not deepen existing paths.
+Use `storage=:lsbtree` with `block_shape`. Select an independent MSB tree from the highest set bits
+of the encoded coordinates, then traverse from high bits to low bits. Small coordinates select shallow
+trees; inserting large coordinates into deeper trees leaves those paths unchanged.
+
+Signed coordinates use unsigned zigzag encoding, placing small positive and negative values together.
+The root array covers the platform's `Int` width; empty roots allocate no tree nodes.
 
 ### Block shapes and coordinate bounds
 

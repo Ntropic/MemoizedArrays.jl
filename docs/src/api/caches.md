@@ -32,8 +32,8 @@ JITArray
 
 ## [Bounded caching](@id bounded)
 
-Limit the number of resident values. Capacity includes active generators: when every slot is generating,
-another missing request waits for capacity. Eviction does not invalidate values already returned.
+Limit the number of stored values. Values are generated before admission and eviction.
+Full caches reuse evicted entry objects. Eviction does not mutate or invalidate values already returned.
 `isready` neither generates values nor changes recency.
 
 ```@docs
@@ -50,18 +50,8 @@ SampledLRUArray
 ExactLRUArray
 ```
 
-### Sampled-cache clocks
+### Sampled-cache recency
 
-Pass a symbol or clock object through `clock`. No background timer is required.
-
-| Symbol | Recency measure |
-|---|---|
-| `:lossy` (default) | Per-cache access counter; simultaneous increments may be lost. |
-| `:coarse` | Operating system's approximate monotonic time. |
-| `:nanosecond` | Julia's `time_ns()`. |
-
-```@docs
-LossyCounter
-CoarseClock
-NanosecondClock
-```
+A per-cache `UInt64` counter tracks accesses. Each scalar access advances it by one.
+Batch requests share one stamp and advance the counter by their request count, including duplicates.
+Empty batches leave the counter unchanged.

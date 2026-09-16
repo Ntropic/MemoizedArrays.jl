@@ -1,3 +1,7 @@
+# Package entry point: exports, shared types and source includes.
+# Flow: cache[i, j] → ArrayInterface checks coordinates → the selected cache finds or generates a value.
+# Synchronous execution: cache types manage retention; maps locate entries.
+
 module JITArrays
 
 """
@@ -7,7 +11,7 @@ An abstract vector with element type `T`, or a length-`N` tuple of elements of t
 """
 const VT{N,T} = Union{AbstractVector{T},NTuple{N,T}}
 
-@inline as_tuple(x::NTuple{N,T}, ::Val{N}) where {N,T} = x
+@inline as_tuple(x::Tuple{Vararg{Any,N}}, ::Val{N}) where N = x
 
 @inline function as_tuple(x::AbstractVector, ::Val{N}) where {N}
     if length(x) != N
@@ -26,19 +30,18 @@ end
 
 export AbstractJITArray, JITArray, LRUArray, ExactLRUArray, SampledLRUArray, generate!
 export SparseJITArray, SparseLRUArray
-export CoarseClock, NanosecondClock, LossyCounter
 
-"""Indexed cache with declared value type `ValueType`."""
-abstract type AbstractJITArray{ValueType,N} <: AbstractArray{ValueType,N} end
+"""Cache interface parameterized by value type, dimension count and storage type."""
+abstract type AbstractJITArray{ValueType,N,M} <: AbstractArray{ValueType,N} end
+
+abstract type SparseMap{T,N} end
 
 include("caches/JITArray.jl")
 include("caches/ExactLRUArray.jl")
-include("caches/Clocks.jl")
 include("caches/SampledLRUArray.jl")
 include("maps/ArrayMap.jl")
 include("maps/DictMap.jl")
 include("maps/TreeMap.jl")
 include("ArrayInterface.jl")
-include("CacheCore.jl")
 
 end # module JITArrays

@@ -1,69 +1,71 @@
-abstract type _TreeNode{T,N} end
+# Sparse tree storage: one MSB tree or MSB roots selected by coordinate bit depth.
+# Allocates branches on demand and prunes unused storage after eviction.
 
-# Prefixes are immutable; only bounded caches maintain pruning counters.
-mutable struct _TreeBranch{T,N} <: _TreeNode{T,N}
+abstract type TreeNode{T,N} end
+
+# Prefixes are immutable; counters track occupied entries and children.
+mutable struct TreeBranch{T,N} <: TreeNode{T,N}
     const prefix::NTuple{N,UInt}
     const level::Int
-    const children::AtomicMemory{Union{Nothing,_TreeNode{T,N}}}
+    const children::Memory{Union{Nothing,TreeNode{T,N}}}
     used::Int
     occupied::Int
 end
 
-mutable struct _TreeLeaf{T,N} <: _TreeNode{T,N}
+mutable struct TreeLeaf{T,N} <: TreeNode{T,N}
     const prefix::NTuple{N,UInt}
-    const values::AtomicMemory{T}
+    const values::Memory{T}
     used::Int
 end
 
-mutable struct _LSBNode{T,N}
-    const values::AtomicMemory{T}
-    const children::AtomicMemory{Union{Nothing,_LSBNode{T,N}}}
-    used::Int
-    children_used::Int
-end
-
-struct _LeafSlot{L}
+struct LeafSlot{L}
     leaf::L
     address::Int
 end
 
+struct TreeHint{T,N}
+    link::MemoryRef{Union{Nothing,TreeNode{T,N}}}
+    parent::Union{Nothing,TreeBranch{T,N}}
+    address::Int # Entry address for a found leaf, child address for a miss.
+end
+
+@inline preparedentry(leaf::TreeLeaf, hint::TreeHint) = @inbounds leaf.values[hint.address]
+
 """Most significant bit (MSB) radix map: traverse high coordinate bits first."""
-struct MSBRadixMap{T,N,BlockShape}
-    roots::AtomicMemory{Union{Nothing,_TreeNode{T,N}}}
+struct MSBRadixMap{T,N,BlockShape} <: SparseMap{T,N}
+    roots::Memory{Union{Nothing,TreeNode{T,N}}}
     empty::Empty
 end
 
-"""Least significant bit (LSB) radix map: traverse low coordinate bits first."""
-struct LSBRadixMap{T,N,BlockShape}
-    root::_LSBNode{T,N}
+"""MSB trees selected by coordinate bit depth; storage option `:lsbtree`."""
+struct LSBRadixMap{T,N,BlockShape} <: SparseMap{T,N}
+    roots::Memory{Union{Nothing,TreeNode{T,N}}}
     empty::Empty
 end
 
-const _RadixMap{T,N,B} = Union{MSBRadixMap{T,N,B},LSBRadixMap{T,N,B}}
+const RadixMap{T,N,B} = Union{MSBRadixMap{T,N,B},LSBRadixMap{T,N,B}}
 
 # Unsigned zigzag includes typemin(Int) without signed overflow.
 @inline signed2unsigned(i::Int) = (reinterpret(UInt, i) << 1) ⊻ reinterpret(UInt, i >> (8sizeof(Int) - 1))
 @inline tree_key(key::NTuple{N,Int}) where N = ntuple(i -> signed2unsigned(key[i]), Val(N))
-@inline store_hash(::_RadixMap, key) = tree_key(key)
-@inline block_shape(::_RadixMap{T,N,B}) where {T,N,B} = B
-@inline function node_level(node::_TreeNode{T,N}) where {T,N}
-    if node isa _TreeLeaf{T,N}
+@inline store_hash(::RadixMap, key) = tree_key(key)
+@inline block_shape(::RadixMap{T,N,B}) where {T,N,B} = B
+@inline function node_level(node::TreeNode{T,N}) where {T,N}
+    if node isa TreeLeaf{T,N}
         return 0
     end
-    return (node::_TreeBranch{T,N}).level
+    return (node::TreeBranch{T,N}).level
 end
-@inline function node_prefix(node::_TreeNode{T,N}) where {T,N}
-    if node isa _TreeLeaf{T,N}
+@inline function node_prefix(node::TreeNode{T,N}) where {T,N}
+    if node isa TreeLeaf{T,N}
         return node.prefix
     end
-    return (node::_TreeBranch{T,N}).prefix
+    return (node::TreeBranch{T,N}).prefix
 end
 
-@inline slot_entry(slot::_LeafSlot) = @inbounds @atomic :acquire slot.leaf.values[slot.address]
-@inline slot_publish!(slot::_LeafSlot, value) = (@inbounds @atomic :release slot.leaf.values[slot.address] = value)
-@inline slot_claim!(slot::_LeafSlot, empty, entry) =
-    @inbounds @atomicreplace :acquire_release :acquire slot.leaf.values[slot.address] empty => entry
-store_retain!(::_RadixMap, slot::_LeafSlot) = (slot.leaf.used += 1)
+@inline slot_entry(slot::LeafSlot) = @inbounds slot.leaf.values[slot.address]
+@inline slot_publish!(slot::LeafSlot, value) = (@inbounds slot.leaf.values[slot.address] = value)
+store_retain!(::RadixMap, slot::LeafSlot) = (slot.leaf.used += 1)
 
 # Validate local blocks without multiplying the global coordinate extents.
 function block_length(shape, minimum::Int)
@@ -77,12 +79,9 @@ function block_length(shape, minimum::Int)
     return count
 end
 
-@inline function tree_bits(store::MSBRadixMap, axis::Int, level::Int)
-    return (level + 1) * trailing_zeros(block_shape(store)[axis])
-end
-@inline tree_bits(::LSBRadixMap, axis::Int, level::Int) = 0
+@inline tree_bits(store::RadixMap, axis::Int, level::Int) = (level + 1) * trailing_zeros(block_shape(store)[axis])
 
-@inline function tree_prefix(store::MSBRadixMap{T,N}, key, level::Int) where {T,N}
+@inline function tree_prefix(store::RadixMap{T,N}, key, level::Int) where {T,N}
     return ntuple(i -> key[i] & (typemax(UInt) << unsigned(tree_bits(store, i, level))), Val(N))
 end
 
@@ -97,10 +96,13 @@ end
     end
     return level
 end
-@inline tree_level(store::MSBRadixMap, key) = tree_level(block_shape(store), key)
+@inline tree_level(store::RadixMap, key) = tree_level(block_shape(store), key)
+
+@inline rootindex(::MSBRadixMap, encoded) = 1
+@inline rootindex(store::LSBRadixMap, encoded) = tree_level(store, encoded) + 1
 
 # Flatten only a checked local block in column-major order.
-@inline function tree_address(store::_RadixMap{T,N}, key, level::Int) where {T,N}
+@inline function tree_address(store::RadixMap{T,N}, key, level::Int) where {T,N}
     address, shift = UInt(0), 0
     for i in 1:N
         width = block_shape(store)[i]
@@ -111,214 +113,191 @@ end
     return Int(address) + 1
 end
 
-function MSBRadixMap(::Type{T}, ranges::NTuple{N}, block::VT{N,Int}, empty::Empty) where {T,N}
+function MSBRadixMap(::Type{T}, ranges::Tuple{Vararg{Any,N}}, block::VT{N,Int}, empty::Empty) where {T,N}
     @astuple N block
     block_length(block, 2)
-    roots = empty_map(Union{Nothing,_TreeNode{T,N}}, (1,), nothing)
+    roots = empty_map(Union{Nothing,TreeNode{T,N}}, (1,), nothing)
     return MSBRadixMap{T,N,block}(roots, empty)
 end
 
-function lsb_node(::Type{T}, ::Val{N}, block, empty) where {T,N}
-    values = empty_map(T, block, empty)
-    children = empty_map(Union{Nothing,_LSBNode{T,N}}, block, nothing)
-    return _LSBNode{T,N}(values, children, 0, 0)
-end
-lsb_node(store::LSBRadixMap{T,N}) where {T,N} =
-    lsb_node(T, Val(N), block_shape(store), store.empty)
-
-function LSBRadixMap(::Type{T}, ranges::NTuple{N}, block::VT{N,Int}, empty::Empty) where {T,N}
+function LSBRadixMap(::Type{T}, ranges::Tuple{Vararg{Any,N}}, block::VT{N,Int}, empty::Empty) where {T,N}
     @astuple N block
     block_length(block, 2)
-    return LSBRadixMap{T,N,block}(lsb_node(T, Val(N), block, empty), empty)
+    levels = tree_level(block, ntuple(_ -> typemax(UInt), Val(N))) + 1
+    roots = empty_map(Union{Nothing,TreeNode{T,N}}, (levels,), nothing)
+    return LSBRadixMap{T,N,block}(roots, empty)
 end
 
-function tree_leaf(store::MSBRadixMap{T,N}, key) where {T,N}
-    return _TreeLeaf{T,N}(tree_prefix(store, key, 0), empty_map(T, block_shape(store), store.empty), 0)
+function tree_leaf(store::RadixMap{T,N}, key) where {T,N}
+    return TreeLeaf{T,N}(tree_prefix(store, key, 0), empty_map(T, block_shape(store), store.empty), 0)
 end
 
-function tree_branch(store::MSBRadixMap{T,N}, key, level::Int) where {T,N}
-    children = empty_map(Union{Nothing,_TreeNode{T,N}}, block_shape(store), nothing)
-    return _TreeBranch{T,N}(tree_prefix(store, key, level), level, children, 0, 0)
+function tree_branch(store::RadixMap{T,N}, key, level::Int) where {T,N}
+    children = empty_map(Union{Nothing,TreeNode{T,N}}, block_shape(store), nothing)
+    return TreeBranch{T,N}(tree_prefix(store, key, level), level, children, 0, 0)
 end
 
-# Readers follow atomically published nodes and verify compressed prefixes.
-@inline function store_lookup(store::MSBRadixMap{T,N}, key, encoded) where {T,N}
-    node = @inbounds @atomic :acquire store.roots[1]
-    while node !== nothing
-        if node isa _TreeLeaf{T,N}
-            if tree_prefix(store, encoded, 0) != node.prefix
-                return nothing
-            end
-            return _LeafSlot(node, tree_address(store, encoded, 0))
+# Follow nodes and verify compressed prefixes.
+@inline store_lookup(store::RadixMap, key, encoded) = treefind(store, encoded, Val(false))
+@inline prepare(store::RadixMap, key, encoded) = treefind(store, encoded, Val(true))
+
+@inline function treefind(store::RadixMap{T,N}, encoded, ::Val{prepared}) where {T,N,prepared}
+    index = rootindex(store, encoded)
+    link = @inbounds memoryref(store.roots, index)
+    # Adjacent levels already establish the child's prefix through the selected digit.
+    level = store isa LSBRadixMap ? index : typemax(Int)
+    parent, address = nothing, 1
+    while true
+        node = slot_entry(link)
+        hint = TreeHint{T,N}(link, parent, address)
+        if node === nothing
+            return prepared ? (nothing, hint) : nothing
         end
-        branch = node::_TreeBranch{T,N}
-        if tree_prefix(store, encoded, branch.level) != branch.prefix
-            return nothing
+        if node isa TreeLeaf{T,N}
+            if level != 1 && tree_prefix(store, encoded, 0) != node.prefix
+                return prepared ? (nothing, hint) : nothing
+            end
+            address = tree_address(store, encoded, 0)
+            return prepared ? (node, TreeHint{T,N}(link, parent, address)) : LeafSlot(node, address)
+        end
+        branch = node::TreeBranch{T,N}
+        if branch.level + 1 != level && tree_prefix(store, encoded, branch.level) != branch.prefix
+            return prepared ? (nothing, hint) : nothing
         end
         address = tree_address(store, encoded, branch.level)
-        node = @inbounds @atomic :acquire branch.children[address]
+        level = branch.level
+        parent = branch
+        link = @inbounds memoryref(branch.children, address)
     end
-    return nothing
 end
 
-function tree_add_child!(branch::_TreeBranch, address::Int, child, ::Val{Bounded}) where Bounded
-    @inbounds @atomic :release branch.children[address] = child
-    if Bounded
-        branch.used += 1
-        branch.occupied ⊻= address
-    end
-    return nothing
-end
-
-# Unbounded insertion retries the observed link; bounded insertion owns the outer lock.
-@inline function tree_publish!(link, old, node, parent, address::Int, ::Val{Bounded}) where Bounded
-    if Bounded
-        slot_publish!(link, node)
-        if old === nothing && parent !== nothing
-            parent.used += 1
-            parent.occupied ⊻= address
+@noinline function reserve!(store::RadixMap, key, encoded, slot, hint)
+    if slot !== nothing
+        if slot.used > 0
+            return LeafSlot(slot, hint.address)
         end
-        return true
+        return store_reserve!(store, key, encoded)
     end
-    return slot_claim!(link, old, node).success
+    link, parent, address = hint.link, hint.parent, hint.address
+    if parent === nothing || parent.used >= 2
+        return treereserve!(store, encoded, link, parent, address)
+    end
+    return store_reserve!(store, key, encoded)
 end
 
-function store_reserve!(store::MSBRadixMap{T,N}, key, encoded, bounded::Val{Bounded}) where {T,N,Bounded}
-    link = @inbounds memoryref(store.roots, 1)
-    parent, address = nothing, 1
+function tree_add_child!(branch::TreeBranch, address::Int, child)
+    @inbounds branch.children[address] = child
+    branch.used += 1
+    branch.occupied ⊻= address
+    return nothing
+end
+
+function tree_publish!(link, old, node, parent, address::Int)
+    slot_publish!(link, node)
+    if old === nothing && parent !== nothing
+        parent.used += 1
+        parent.occupied ⊻= address
+    end
+    return nothing
+end
+
+function store_reserve!(store::RadixMap{T,N}, key, encoded) where {T,N}
+    link = @inbounds memoryref(store.roots, rootindex(store, encoded))
+    return treereserve!(store, encoded, link, nothing, 1)
+end
+
+function treereserve!(store::RadixMap{T,N}, encoded, link, parent, address) where {T,N}
     while true
         node = slot_entry(link)
         if node === nothing
             leaf = tree_leaf(store, encoded)
-            if tree_publish!(link, node, leaf, parent, address, bounded)
-                return _LeafSlot(leaf, tree_address(store, encoded, 0))
-            end
+            tree_publish!(link, node, leaf, parent, address)
+            return LeafSlot(leaf, tree_address(store, encoded, 0))
         elseif tree_prefix(store, encoded, node_level(node)) != node_prefix(node)
             prefix = node_prefix(node)
             difference = ntuple(i -> prefix[i] ⊻ encoded[i], Val(N))
             level = tree_level(store, difference)
             branch = tree_branch(store, encoded, level)
             leaf = tree_leaf(store, encoded)
-            tree_add_child!(branch, tree_address(store, prefix, level), node, bounded)
-            tree_add_child!(branch, tree_address(store, encoded, level), leaf, bounded)
-            if tree_publish!(link, node, branch, parent, address, bounded)
-                return _LeafSlot(leaf, tree_address(store, encoded, 0))
-            end
-        elseif node isa _TreeLeaf{T,N}
-            return _LeafSlot(node, tree_address(store, encoded, 0))
+            tree_add_child!(branch, tree_address(store, prefix, level), node)
+            tree_add_child!(branch, tree_address(store, encoded, level), leaf)
+            tree_publish!(link, node, branch, parent, address)
+            return LeafSlot(leaf, tree_address(store, encoded, 0))
+        elseif node isa TreeLeaf{T,N}
+            return LeafSlot(node, tree_address(store, encoded, 0))
         else
-            parent = node::_TreeBranch{T,N}
+            parent = node::TreeBranch{T,N}
             address = tree_address(store, encoded, parent.level)
             link = @inbounds memoryref(parent.children, address)
         end
     end
 end
 
-@inline function lsb_fits(store::LSBRadixMap{T,N}, key) where {T,N}
-    for i in 1:N
-        if key[i] >= UInt(block_shape(store)[i])
-            return false
-        end
+# Compressed branches have at least two children; only the leaf's parent can collapse.
+function tree_remove!(store::RadixMap{T,N}, encoded, leaf) where {T,N}
+    link = @inbounds memoryref(store.roots, rootindex(store, encoded))
+    node = slot_entry(link)
+    if node === leaf
+        slot_publish!(link, nothing)
+        return nothing
     end
-    return true
-end
-@inline lsb_shift(store::LSBRadixMap{T,N}, key) where {T,N} =
-    ntuple(i -> key[i] >> trailing_zeros(block_shape(store)[i]), Val(N))
-
-@inline function store_lookup(store::LSBRadixMap, key, encoded)
-    node = store.root
-    while !lsb_fits(store, encoded)
-        address = tree_address(store, encoded, 1)
-        child = @inbounds @atomic :acquire node.children[address]
-        if child === nothing
+    while true
+        branch = node::TreeBranch{T,N}
+        address = tree_address(store, encoded, branch.level)
+        child = @inbounds branch.children[address]
+        if child === leaf
+            @inbounds branch.children[address] = nothing
+            branch.used -= 1
+            branch.occupied ⊻= address
+            if branch.used == 1
+                slot_publish!(link, @inbounds branch.children[branch.occupied])
+            end
             return nothing
         end
+        link = @inbounds memoryref(branch.children, address)
         node = child
-        encoded = lsb_shift(store, encoded)
     end
-    return _LeafSlot(node, tree_address(store, encoded, 0))
 end
 
-function store_reserve!(store::LSBRadixMap, key, encoded, ::Val{Bounded}) where Bounded
-    node = store.root
-    while !lsb_fits(store, encoded)
-        address = tree_address(store, encoded, 1)
-        link = @inbounds memoryref(node.children, address)
-        child = slot_entry(link)
-        if child === nothing
-            child = lsb_node(store)
-            if Bounded
-                slot_publish!(link, child)
-                node.children_used += 1
-            else
-                claim = slot_claim!(link, nothing, child)
-                if !claim.success
-                    child = claim.old
-                end
-            end
-        end
-        node = child
-        encoded = lsb_shift(store, encoded)
-    end
-    return _LeafSlot(node, tree_address(store, encoded, 0))
-end
-
-store_reserve!(store::_RadixMap, key, encoded) = store_reserve!(store, key, encoded, Val(true))
-
-# Occupancy XOR finds a sole MSB child without scanning its block.
-function tree_remove!(store::MSBRadixMap{T,N}, node, encoded, leaf) where {T,N}
-    if node isa _TreeLeaf{T,N}
-        if node !== leaf
-            error("attempted to remove a detached cache leaf")
-        end
-        return nothing
-    end
-    branch = node::_TreeBranch{T,N}
-    address = tree_address(store, encoded, branch.level)
-    child = @inbounds @atomic :acquire branch.children[address]
-    replacement = tree_remove!(store, child, encoded, leaf)
-    @inbounds @atomic :release branch.children[address] = replacement
-    if replacement === nothing
-        branch.used -= 1
-        branch.occupied ⊻= address
-    end
-    if branch.used == 0
-        return nothing
-    elseif branch.used == 1
-        return @inbounds @atomic :acquire branch.children[branch.occupied]
-    end
-    return branch
-end
-
-function store_delete!(store::MSBRadixMap, key, slot::_LeafSlot)
+function store_delete!(store::RadixMap, key, slot::LeafSlot)
     slot_publish!(slot, store.empty)
     slot.leaf.used -= 1
     if slot.leaf.used == 0
-        root = @inbounds @atomic :acquire store.roots[1]
-        root = tree_remove!(store, root, tree_key(key), slot.leaf)
-        @inbounds @atomic :release store.roots[1] = root
+        tree_remove!(store, tree_key(key), slot.leaf)
     end
     return nothing
 end
 
-function tree_remove!(store::LSBRadixMap, node::_LSBNode, encoded, leaf)
-    if node !== leaf
-        address = tree_address(store, encoded, 1)
-        child = @inbounds @atomic :acquire node.children[address]
-        replacement = tree_remove!(store, child, lsb_shift(store, encoded), leaf)
-        if replacement === nothing
-            @inbounds @atomic :release node.children[address] = nothing
-            node.children_used -= 1
+function delete_key!(map::RadixMap{T,N}, key) where {T,N}
+    encoded = tree_key(key)
+    link = @inbounds memoryref(map.roots, rootindex(map, encoded))
+    node = slot_entry(link)
+    parent, address = nothing, 1
+    while node isa TreeBranch{T,N}
+        parent = node
+        address = tree_address(map, encoded, parent.level)
+        child = @inbounds parent.children[address]
+        if child isa TreeLeaf{T,N}
+            node = child
+            break
         end
+        link = @inbounds memoryref(parent.children, address)
+        node = child
     end
-    return node.used == 0 && node.children_used == 0 ? nothing : node
-end
-
-function store_delete!(store::LSBRadixMap, key, slot::_LeafSlot)
-    slot_publish!(slot, store.empty)
-    slot.leaf.used -= 1
-    if slot.leaf.used == 0 && slot.leaf.children_used == 0
-        tree_remove!(store, store.root, tree_key(key), slot.leaf)
+    leaf = node::TreeLeaf{T,N}
+    @inbounds leaf.values[tree_address(map, encoded, 0)] = map.empty
+    leaf.used -= 1
+    if leaf.used == 0
+        if parent === nothing
+            slot_publish!(link, nothing)
+        else
+            @inbounds parent.children[address] = nothing
+            parent.used -= 1
+            parent.occupied ⊻= address
+            if parent.used == 1
+                slot_publish!(link, @inbounds parent.children[parent.occupied])
+            end
+        end
     end
     return nothing
 end

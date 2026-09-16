@@ -1,53 +1,40 @@
-struct _HashMarker
-    deleted::Bool
-end
-const _HASH_EMPTY = _HashMarker(false)
-const _HASH_DELETED = _HashMarker(true)
+# Dictionary storage: map coordinate tuples to stable records using a hash table.
+# Resizing preserves records; deletion leaves tombstones for probing.
+
+@enum HashMarker::UInt8 HASH_EMPTY HASH_DELETED
 
 # Records stay at the same location when the probe table grows.
-mutable struct _HashRecord{T,N}
+mutable struct HashRecord{T,N}
     const key::NTuple{N,Int}
     const hash::UInt
-    @atomic value::T
+    value::T
 end
 
-struct _HashTable{T,N}
-    slots::AtomicMemory{Union{_HashMarker,_HashRecord{T,N}}}
-end
-
-mutable struct DictMap{T,N}
-    @atomic table::_HashTable{T,N}
+mutable struct DictMap{T,N} <: SparseMap{T,N}
+    table::Memory{Union{HashMarker,HashRecord{T,N}}}
     count::Int
     used::Int
-    empty::Empty
-    const guard::ReentrantLock
+    insertions::UInt
+    const empty::Empty
 end
 
-# Allocate probe slots without allocating key records.
-function hash_table(::Type{T}, ::Val{N}, count::Int) where {T,N}
-    slots = empty_map(Union{_HashMarker,_HashRecord{T,N}}, (count,), _HASH_EMPTY)
-    return _HashTable{T,N}(slots)
-end
-
-DictMap(::Type{T}, ::Val{N}, empty::Empty) where {T,N} =
-    DictMap{T,N}(hash_table(T, Val(N), 64), 0, 0, empty, ReentrantLock())
+hash_table(::Type{T}, ::Val{N}, count::Int) where {T,N} = empty_map(Union{HashMarker,HashRecord{T,N}}, (count,), HASH_EMPTY)
+DictMap(::Type{T}, ::Val{N}, empty::Empty) where {T,N} = DictMap{T,N}(hash_table(T, Val(N), 64), 0, 0, UInt(0), empty)
 
 @inline store_hash(::DictMap, key) = hash(key)
-@inline slot_entry(slot::_HashRecord) = @atomic :acquire slot.value
-@inline slot_publish!(slot::_HashRecord, value) = (@atomic :release slot.value = value)
-@inline slot_claim!(slot::_HashRecord, empty, pending) =
-    @atomicreplace :acquire_release :acquire slot.value empty => pending
-store_retain!(::DictMap, slot::_HashRecord) = nothing
+@inline slot_entry(slot::HashRecord) = slot.value
+@inline slot_publish!(slot::HashRecord, value) = (slot.value = value)
+store_retain!(::DictMap, slot::HashRecord) = nothing
 
-# Probe one captured table; writers publish complete records atomically.
-@inline function hash_find(table::_HashTable, key, hashed::UInt)
-    mask = UInt(length(table.slots) - 1)
+# Find a record or the first reusable slot in its probe chain.
+@inline function hash_find(table::Memory, key, hashed::UInt)
+    mask = UInt(length(table) - 1)
     address = Int(hashed & mask) + 1
     vacant = 0
     while true
-        entry = @inbounds @atomic :acquire table.slots[address]
-        if entry isa _HashMarker
-            if !entry.deleted
+        entry = @inbounds table[address]
+        if entry isa HashMarker
+            if entry === HASH_EMPTY
                 return nothing, vacant == 0 ? address : vacant
             end
             if vacant == 0
@@ -61,54 +48,77 @@ store_retain!(::DictMap, slot::_HashRecord) = nothing
 end
 
 @inline function store_lookup(store::DictMap, key, hashed::UInt)
-    table = @atomic :acquire store.table
+    table = store.table
     return first(hash_find(table, key, hashed))
 end
 
-# Rebuild under the structural lock; old readers retain their table and shared records.
+@inline function prepare(store::DictMap, key, hashed::UInt)
+    table = store.table
+    record, address = hash_find(table, key, hashed)
+    return record, (table, address, store.insertions)
+end
+
+# Insertions can invalidate a saved position; eviction only leaves tombstones.
+@noinline function reserve!(store::DictMap, key, hashed, record, hint)
+    table, address, insertions = hint
+    if table !== store.table || insertions != store.insertions ||
+        (record !== nothing && (@inbounds table[address]) !== record)
+        return store_reserve!(store, key, hashed)
+    end
+    return hashreserve!(store, key, hashed, table, record, address)
+end
+
+# Rebuild the probe table, retaining its records.
 function hash_rebuild!(store::DictMap{T,N}, count::Int) where {T,N}
-    old = @atomic :acquire store.table
+    old = store.table
     table = hash_table(T, Val(N), count)
-    for i in eachindex(old.slots)
-        entry = @inbounds @atomic :acquire old.slots[i]
-        if entry isa _HashRecord
+    for i in eachindex(old)
+        entry = @inbounds old[i]
+        if entry isa HashRecord
             _, address = hash_find(table, entry.key, entry.hash)
-            @inbounds @atomic :release table.slots[address] = entry
+            @inbounds table[address] = entry
         end
     end
     store.used = store.count
-    @atomic :release store.table = table
+    store.table = table
     return table
 end
 
-# Reserve a stable missing record; caller holds the structural lock.
+# Reserve a stable missing record.
 function store_reserve!(store::DictMap{T,N}, key, hashed::UInt) where {T,N}
-    table = @atomic :acquire store.table
+    table = store.table
     entry, address = hash_find(table, key, hashed)
+    return hashreserve!(store, key, hashed, table, entry, address)
+end
+
+@inline function hashreserve!(store::DictMap{T,N}, key, hashed, table, entry, address) where {T,N}
     if entry !== nothing
         return entry
     end
-    count = length(table.slots)
-    if store.used + 1 > 3(count ÷ 4)
+    count = length(table)
+    previous = @inbounds table[address]
+    # Reusing a tombstone does not increase occupied table space.
+    if previous === HASH_EMPTY && store.used + 1 > 3(count ÷ 4)
         if store.count + 1 > 3(count ÷ 4)
-            count = Base.checked_mul(count, 2)
+            count = Base.checked_mul(count, 4)
         end
         table = hash_rebuild!(store, count)
         _, address = hash_find(table, key, hashed)
+        previous = HASH_EMPTY
     end
-    previous = @inbounds @atomic :acquire table.slots[address]
-    record = _HashRecord{T,N}(key, hashed, store.empty)
-    @inbounds @atomic :release table.slots[address] = record
+    record = HashRecord{T,N}(key, hashed, store.empty)
+    @inbounds table[address] = record
     store.count += 1
-    if previous === _HASH_EMPTY
+    store.insertions += UInt(1)
+    if previous === HASH_EMPTY
         store.used += 1
     end
     return record
 end
 
 # Remove only the current record, preserving probe chains with a tombstone.
-function store_delete!(store::DictMap, key, slot::_HashRecord)
-    table = @atomic :acquire store.table
+function store_delete!(store::DictMap, key, slot::HashRecord)
+    table = store.table
     entry, address = hash_find(table, key, slot.hash)
     if entry !== slot
         error("attempted to remove a detached cache record")
@@ -116,18 +126,16 @@ function store_delete!(store::DictMap, key, slot::_HashRecord)
     return hash_delete!(store, table, slot, address)
 end
 
-# Eviction needs one probe; captured failure slots still use the identity check above.
-function delete_key!(store::DictMap, key)
-    table = @atomic :acquire store.table
+# Evict a record with one probe.
+@inline function delete_key!(store::DictMap, key)
+    table = store.table
     record, address = hash_find(table, key, hash(key))
     return hash_delete!(store, table, record, address)
 end
 
 @inline function hash_delete!(store, table, record, address)
     slot_publish!(record, store.empty)
-    @inbounds @atomic :release table.slots[address] = _HASH_DELETED
+    @inbounds table[address] = HASH_DELETED
     store.count -= 1
     return nothing
 end
-
-store_reserve!(store::DictMap, key, hashed::UInt, ::Val) = store_reserve!(store, key, hashed)

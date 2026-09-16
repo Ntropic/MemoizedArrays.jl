@@ -1,10 +1,11 @@
+# Exact LRU cache, entry and constructors; maintains access order for eviction.
+
 mutable struct ExactLRUEntry{V,Key} <: AbstractEntry{V}
-    @atomic state::Union{Nothing,Threads.Condition,Bool,Empty}
     key::Key
     previous::Union{Nothing,ExactLRUEntry{V,Key}}
     next::Union{Nothing,ExactLRUEntry{V,Key}}
     value::V
-    ExactLRUEntry{V,Key}(key) where {V,Key} = new{V,Key}(nothing, key, nothing, nothing)
+    ExactLRUEntry{V,Key}(key, value) where {V,Key} = new{V,Key}(key, nothing, nothing, value)
 end
 
 """
@@ -13,15 +14,14 @@ end
 Cache values with exact LRU eviction. Accept sizes or coordinate ranges.
 Sparse storage: `:dict` (default), `:msbtree`, `:lsbtree`; trees require `block_shape`.
 """
-mutable struct ExactLRUArray{V,N,E,M,D,G} <: AbstractJITArray{V,N}
+mutable struct ExactLRUArray{V,N,M,D,G,Key} <: AbstractJITArray{V,N,M}
     const map::M
     const domain::D
     const generator::G
-    oldest::Union{Nothing,E}
-    newest::Union{Nothing,E}
+    oldest::Union{Nothing,ExactLRUEntry{V,Key}}
+    newest::Union{Nothing,ExactLRUEntry{V,Key}}
     const capacity::Int
     count::Int
-    const available::Threads.Condition
 end
 
 function ExactLRUArray{V}(generator, domain::VT{N,T}; capacity::Int,
@@ -31,26 +31,24 @@ function ExactLRUArray{V}(generator, domain::VT{N,T}; capacity::Int,
     return construct(ExactLRUArray{V}, domain, generator, capacity, storage, block_shape)
 end
 
-ExactLRUArray{V}(generator, dims::Int...; kwargs...) where V =
-    ExactLRUArray{V}(generator, dims; kwargs...)
+ExactLRUArray{V}(generator, dims::Int...; kwargs...) where V = ExactLRUArray{V}(generator, dims; kwargs...)
 
-ExactLRUArray{V}(generator, axis::AbstractUnitRange{Int}, axes::AbstractUnitRange{Int}...; kwargs...) where V =
-    ExactLRUArray{V}(generator, (axis, axes...); kwargs...)
+ExactLRUArray{V}(generator, axis::AbstractUnitRange{Int}, axes::AbstractUnitRange{Int}...; kwargs...) where V = ExactLRUArray{V}(generator, (axis, axes...); kwargs...)
 
-ExactLRUArray{V}(domain::VT{N,T}, capacity::Int, generator::Function; kwargs...) where {V,N,T} =
-    ExactLRUArray{V}(generator, domain; capacity, kwargs...)
+ExactLRUArray{V}(domain::VT{N,T}, capacity::Int, generator::Function; kwargs...) where {V,N,T} = ExactLRUArray{V}(generator, domain; capacity, kwargs...)
 
 function construct(::Type{ExactLRUArray{V}}, input::Tuple, generator::G, capacity::Int,
     storage, block) where {V,G}
     capacity < 1 && throw(ArgumentError("capacity must be positive"))
     domain = axis_domain(input, storage)
-    E = ExactLRUEntry{V,entry_keytype(domain, storage)}
+    Key = entry_keytype(domain, storage)
+    E = ExactLRUEntry{V,Key}
     map = make_map(Union{Empty,E}, domain, storage, block)
-    return ExactLRUArray{V,length(domain),E,typeof(map),typeof(domain),G}(
-        map, domain, generator, nothing, nothing, capacity, 0, Threads.Condition())
+    return ExactLRUArray{V,length(domain),typeof(map),typeof(domain),G,Key}(
+        map, domain, generator, nothing, nothing, capacity, 0)
 end
 
-# Remove a ready entry from the access-order list; caller holds the bookkeeping lock.
+# Remove a ready entry from the access-order list.
 @inline function unlink!(cache, entry::ExactLRUEntry)
     previous, next = entry.previous, entry.next
     if previous === nothing
@@ -68,22 +66,20 @@ end
     return nothing
 end
 
-# Append a detached ready entry as newest; caller holds the bookkeeping lock.
+# Append a detached ready entry as newest.
 @inline function append_entry!(cache, entry::ExactLRUEntry)
-    entry.previous = cache.newest
+    newest = cache.newest
+    entry.previous = newest
     entry.next = nothing
-    if cache.newest === nothing
+    if newest === nothing
         cache.oldest = entry
     else
-        cache.newest.next = entry
+        newest.next = entry
     end
     cache.newest = entry
     return nothing
 end
 
-@inline policy_full(cache, ::Type{<:ExactLRUEntry}) = cache.count == cache.capacity
-@inline policy_no_ready(cache, ::Type{<:ExactLRUEntry}) = cache.oldest === nothing
-@inline policy_add!(cache, entry::ExactLRUEntry, stamp) = append_entry!(cache, entry)
 
 @inline function policy_touch(cache, entry::ExactLRUEntry, stamp)
     if cache.newest !== entry
@@ -93,20 +89,37 @@ end
     return entry.value
 end
 
-function policy_claim!(cache, entry::ExactLRUEntry)
-    cache.count += 1
-    return nothing
-end
-
-function policy_release!(cache, entry::ExactLRUEntry)
-    cache.count -= 1
-    return nothing
-end
-
-function policy_evict!(cache, ::Type{<:ExactLRUEntry})
+function evict!(cache::ExactLRUArray)
     entry = cache.oldest
     unlink!(cache, entry)
     cache.count -= 1
-    delete_entry!(cache, entry)
-    return nothing
+    delete_key!(cache.map, entry.key)
+    return entry
+end
+
+@inline entrytype(::ExactLRUArray{V,N,M,D,G,Key}) where {V,N,M,D,G,Key} = ExactLRUEntry{V,Key}
+
+@inline function cacheget(cache::ExactLRUArray{V,N,M,D,G,Key}, key, stamp=nothing, indices=nothing) where {V,N,M,D,G,Key}
+    routing = store_hash(cache.map, key)
+    slot, hint = prepare(cache.map, key, routing)
+    if slot !== nothing
+        stored = preparedentry(slot, hint)
+        if stored isa ExactLRUEntry{V,Key}
+            return policy_touch(cache, stored, stamp)
+        end
+    end
+    value = convert(V, cache.generator(generator_indices(cache, key, indices)...))
+    if cache.count == cache.capacity
+        stored = evict!(cache)
+        stored.key = key
+        stored.value = value
+    else
+        stored = ExactLRUEntry{V,Key}(key, value)
+    end
+    slot = reserve!(cache.map, key, routing, slot, hint)
+    store_retain!(cache.map, slot)
+    slot_publish!(slot, stored)
+    append_entry!(cache, stored)
+    cache.count += 1
+    return stored.value
 end

@@ -1,147 +1,175 @@
+# Map-specific routing, collisions, growth and pruning regressions.
+function treecounts(node)
+    if node === nothing
+        return (0, 0, true)
+    elseif node isa JA.TreeLeaf
+        entries = count(i -> !((node.values[i]) isa JA.Empty), eachindex(node.values))
+        return (0, 1, node.used == entries)
+    end
+    branches, leaves, used, occupied = 1, 0, 0, 0
+    valid = true
+    for i in eachindex(node.children)
+        child = node.children[i]
+        if child !== nothing
+            used += 1
+            occupied ⊻= i
+            b, l, child_valid = treecounts(child)
+            branches += b
+            leaves += l
+            valid &= child_valid
+        end
+    end
+    valid &= node.used == used
+    valid &= node.occupied == occupied
+    return branches, leaves, valid
+end
+function treecounts(map::JA.RadixMap)
+    branches, leaves, valid = 0, 0, true
+    for root in map.roots
+        b, l, rootvalid = treecounts(root)
+        branches += b
+        leaves += l
+        valid &= rootvalid
+    end
+    @test valid
+    return branches, leaves
+end
+
 mutable struct MapTestEntry{N}
     key::NTuple{N,Int}
 end
 
-function map_test_slot(map, key)
-    return JITArrays.store_lookup(map, key, JITArrays.store_hash(map, key))
-end
+mapslot(map, key) = JITArrays.store_lookup(map, key, JITArrays.store_hash(map, key))
 
 @testset "Radix map routing and bounded reclamation" begin
     JA = JITArrays
     domain = (typemin(Int):typemax(Int), typemin(Int):typemax(Int))
-    keys = unique(vcat([(i,j) for i in -4:4 for j in -4:4],
+    keys = unique(vcat([(i,j) for i in -1:1 for j in -1:1],
         [(0,typemin(Int)), (typemax(Int),0), (typemin(Int),typemax(Int)), (typemax(Int),typemin(Int))],
-        [(reinterpret(Int, UInt(k) * 0x9e3779b97f4a7c15), k % 3 == 0 ? 0 : k) for k in 1:60]))
-    for Map in (JA.MSBRadixMap, JA.LSBRadixMap), bounded in (true, false),
-        block in ((2,8), (8,2), (4,8))
-        map = Map(Union{JA.Empty,MapTestEntry{2}}, domain, block, JA._EMPTY)
-        slots = [JA.store_reserve!(map, key, JA.store_hash(map, key), Val(bounded)) for key in keys]
+        [(reinterpret(Int, UInt(k) * 0x9e3779b97f4a7c15), k % 3 == 0 ? 0 : k) for k in 1:8]))
+    for Map in (JA.MSBRadixMap, JA.LSBRadixMap),
+        block in ((8,8), (4,8))
+        map = Map(Union{JA.Empty,MapTestEntry{2}}, domain, block, JA.EMPTY)
+        slots = [JA.store_reserve!(map, key, JA.store_hash(map, key)) for key in keys]
         for (key, slot) in zip(keys, slots)
-            @test JA.slot_claim!(slot, JA._EMPTY, MapTestEntry(key)).success
-            if bounded
-                JA.store_retain!(map, slot)
-            end
+            JA.slot_publish!(slot, MapTestEntry(key))
+            JA.store_retain!(map, slot)
+            @test JA.slot_entry(slot).key == key
         end
         for (key, slot) in zip(keys, slots)
-            found = map_test_slot(map, key)
+            found = mapslot(map, key)
             @test found.leaf === slot.leaf
             @test found.address == slot.address
             @test JA.slot_entry(found).key == key
         end
-        root = map isa JA.MSBRadixMap ? (@atomic :acquire map.roots[1]) : map.root
-        sparse_tree_counts(map; bounded)
-        if bounded
-            for (key, slot) in zip(keys, slots)
-                captured = JA.slot_entry(slot)
-                JA.store_delete!(map, key, slot)
-                @test JA.slot_entry(slot) === JA._EMPTY
-                @test captured.key == key
-            end
-            if map isa JA.MSBRadixMap
-                @test (@atomic :acquire map.roots[1]) === nothing
-            else
-                @test map.root === root
-                @test map.root.used == map.root.children_used == 0
-                @test all(i -> (@atomic :acquire root.children[i]) === nothing, eachindex(root.children))
-            end
+        treecounts(map)
+        for (key, slot) in zip(keys, slots)
+            captured = JA.slot_entry(slot)
+            JA.store_delete!(map, key, slot)
+            @test JA.slot_entry(slot) === JA.EMPTY
+            @test captured.key == key
         end
+        @test all(isnothing, map.roots)
     end
     for Map in (JA.MSBRadixMap, JA.LSBRadixMap)
-        map = Map(Union{JA.Empty,MapTestEntry{0}}, (), (), JA._EMPTY)
+        map = Map(Union{JA.Empty,MapTestEntry{0}}, (), (), JA.EMPTY)
         slot = JA.store_reserve!(map, (), ())
         @test slot.address == 1
         JA.slot_publish!(slot, MapTestEntry(()))
         JA.store_retain!(map, slot)
-        @test JA.slot_entry(map_test_slot(map, ())).key == ()
+        @test JA.slot_entry(mapslot(map, ())).key == ()
         JA.store_delete!(map, (), slot)
-        @test JA.slot_entry(slot) === JA._EMPTY
+        @test JA.slot_entry(slot) === JA.EMPTY
     end
 end
 
 @testset "MSB root prefix compression" begin
     JA = JITArrays
     map = JA.MSBRadixMap(Union{JA.Empty,MapTestEntry{2}},
-        (typemin(Int):typemax(Int), typemin(Int):typemax(Int)), (4,8), JA._EMPTY)
+        (typemin(Int):typemax(Int), typemin(Int):typemax(Int)), (4,8), JA.EMPTY)
     keys = ((0,0), (typemin(Int),typemax(Int)))
     central = JA.store_reserve!(map, first(keys), JA.tree_key(first(keys)))
     JA.slot_publish!(central, MapTestEntry(first(keys)))
     JA.store_retain!(map, central)
-    @test (@atomic :acquire map.roots[1]) === central.leaf
+    @test (map.roots[1]) === central.leaf
     distant = JA.store_reserve!(map, last(keys), JA.tree_key(last(keys)))
     JA.slot_publish!(distant, MapTestEntry(last(keys)))
     JA.store_retain!(map, distant)
-    @test map_test_slot(map, first(keys)).leaf === central.leaf
+    @test mapslot(map, first(keys)).leaf === central.leaf
+    middle = JA.store_reserve!(map, (4,0), JA.tree_key((4,0)))
+    JA.slot_publish!(middle, MapTestEntry((4,0)))
+    JA.store_retain!(map, middle)
+    @test treecounts(map) == (2, 3)
+    JA.store_delete!(map, (4,0), middle)
+    @test treecounts(map) == (1, 2)
+    @test mapslot(map, last(keys)).leaf === distant.leaf
     JA.store_delete!(map, last(keys), distant)
-    @test (@atomic :acquire map.roots[1]) === central.leaf
-    @test JA.slot_entry(map_test_slot(map, first(keys))).key == first(keys)
-    sparse_tree_counts(map; bounded=true)
+    @test (map.roots[1]) === central.leaf
+    @test JA.slot_entry(mapslot(map, first(keys))).key == first(keys)
+    treecounts(map)
 end
 
-@testset "Least-significant routing preserves central paths" begin
+@testset "Depth roots preserve small-coordinate trees" begin
     JA = JITArrays
     map = JA.LSBRadixMap(Union{JA.Empty,MapTestEntry{2}},
-        (typemin(Int):typemax(Int), typemin(Int):typemax(Int)), (4,8), JA._EMPTY)
-    central = JA.store_reserve!(map, (0,0), JA.tree_key((0,0)), Val(false))
-    nearby = JA.store_reserve!(map, (1,4), JA.tree_key((1,4)), Val(false))
-    @test central.leaf === map.root
-    @test nearby.leaf === (@atomic :acquire map.root.children[3])
-    JA.store_reserve!(map, (typemin(Int),typemax(Int)), JA.tree_key((typemin(Int),typemax(Int))), Val(false))
-    @test map_test_slot(map, (0,0)).leaf === central.leaf
-    @test map_test_slot(map, (1,4)).leaf === nearby.leaf
-end
-
-@testset "Concurrent child publication and entry claims" begin
-    JA = JITArrays
-    domain = (typemin(Int):typemax(Int), typemin(Int):typemax(Int))
-    keys = [(i <= 24 ? i : reinterpret(Int, UInt(i) * 0x9e3779b97f4a7c15), i % 5 == 0 ? 0 : i)
-        for i in 1:48]
-    for Map in (JA.MSBRadixMap, JA.LSBRadixMap), round in 1:8
-        map = Map(Union{JA.Empty,MapTestEntry{2}}, domain, (2,8), JA._EMPTY)
-        claimed = [Threads.Atomic{Int}(0) for _ in keys]
-        tasks = [Threads.@spawn begin
-            for k in eachindex(keys)
-                i = mod1(k + offset, length(keys))
-                key = keys[i]
-                slot = JA.store_reserve!(map, key, JA.tree_key(key), Val(false))
-                if JA.slot_claim!(slot, JA._EMPTY, MapTestEntry(key)).success
-                    Threads.atomic_add!(claimed[i], 1)
-                end
-            end
-        end for offset in (0,0,1,7,24,47,0,24)]
-        foreach(fetch, tasks)
-        @test all(counter -> counter[] == 1, claimed)
-        @test all(key -> JA.slot_entry(map_test_slot(map, key)).key == key, keys)
-        sparse_tree_counts(map)
+        (typemin(Int):typemax(Int), typemin(Int):typemax(Int)), (8,8), JA.EMPTY)
+    keys = ((3,0), (-4,0), (4,0), (31,0), (32,0), (0,32))
+    for key in keys
+        slot = JA.store_reserve!(map, key, JA.tree_key(key))
+        JA.slot_publish!(slot, MapTestEntry(key))
+        JA.store_retain!(map, slot)
     end
+    @test length(map.roots) == cld(8sizeof(UInt), 3)
+    @test map.roots[1] === mapslot(map, (3,0)).leaf === mapslot(map, (-4,0)).leaf
+    @test map.roots[2] isa JA.TreeBranch
+    @test map.roots[3] isa JA.TreeBranch
+    smallroots = Tuple(map.roots[1:3])
+    distantkey = (typemin(Int), typemax(Int))
+    distant = JA.store_reserve!(map, distantkey, JA.tree_key(distantkey))
+    JA.slot_publish!(distant, MapTestEntry(distantkey))
+    JA.store_retain!(map, distant)
+    @test map.roots[end] === distant.leaf
+    @test all(i -> map.roots[i] === smallroots[i], 1:3)
+    for key in ((4,0), (31,0), distantkey)
+        JA.delete_key!(map, key)
+    end
+    @test map.roots[2] === map.roots[end] === nothing
+    @test all(key -> JA.slot_entry(mapslot(map, key)).key == key, ((3,0), (-4,0), (32,0), (0,32)))
+    treecounts(map)
 end
 
 @testset "Dictionary stable records, collisions, and tombstones" begin
     JA = JITArrays
-    map = JA.DictMap(Union{JA.Empty,MapTestEntry{1}}, Val(1), JA._EMPTY)
-    keys = filter(i -> hash((i,)) & UInt(63) == 0, -10000:10000)[1:60]
+    map = JA.DictMap(Union{JA.Empty,MapTestEntry{1}}, Val(1), JA.EMPTY)
+    keys = filter(i -> hash((i,)) & UInt(63) == 0, -100000:100000)[1:60]
     slots = [JA.store_reserve!(map, (i,), hash((i,))) for i in keys[1:48]]
-    old = @atomic :acquire map.table
-    @test length(old.slots) == 64
+    old = map.table
+    @test length(old) == 64
+    # At the load limit, replacing a deleted slot must not rebuild the table.
+    JA.store_delete!(map, (keys[1],), slots[1])
+    slots[1] = JA.store_reserve!(map, (keys[1],), hash((keys[1],)))
+    @test map.table === old
+    @test map.count == map.used == 48
     for i in keys[49:60]
         push!(slots, JA.store_reserve!(map, (i,), hash((i,))))
     end
-    @test length((@atomic :acquire map.table).slots) == 128
-    @test all(i -> map_test_slot(map, (keys[i],)) === slots[i], eachindex(keys))
+    @test length((map.table)) == 256
+    @test all(i -> mapslot(map, (keys[i],)) === slots[i], eachindex(keys))
     @test first(JA.hash_find(old, (keys[1],), hash((keys[1],)))) === slots[1]
     for (i, slot) in zip(keys, slots)
         JA.slot_publish!(slot, MapTestEntry((i,)))
         captured = JA.slot_entry(slot)
         JA.store_delete!(map, (i,), slot)
-        @test JA.slot_entry(slot) === JA._EMPTY
+        @test JA.slot_entry(slot) === JA.EMPTY
         @test captured.key == (i,)
-        @test map_test_slot(map, (i,)) === nothing
+        @test mapslot(map, (i,)) === nothing
     end
     @test map.count == 0
-    current = @atomic :acquire map.table
-    for i in 1:1000
+    current = map.table
+    for i in 1:512
         slot = JA.store_reserve!(map, (i,), hash((i,)))
         JA.store_delete!(map, (i,), slot)
     end
-    @test (@atomic :acquire map.table) !== current
-    @test length((@atomic :acquire map.table).slots) == 128
+    @test (map.table) !== current
+    @test length((map.table)) == 256
 end
