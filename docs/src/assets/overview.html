@@ -17,8 +17,8 @@ flowchart LR
     C --> B["Bounded · LRUArray"]
     S --> D["Array"]
     S --> H["Dictionary"]
-    S --> M["MSB tree · high bits first"]
-    S --> L["LSB tree · roots by depth"]
+    S --> M["radix tree · high bits first"]
+    S --> L["subtree radix tree · shortcuts by depth"]
     click A "../api.html" "API reference" _parent
     click C "../api/caches.html" "Cache choices" _parent
     click S "../api/storage.html" "Storage choices" _parent
@@ -26,8 +26,8 @@ flowchart LR
     click B "../api/caches.html#bounded" "Limit resident values" _parent
     click D "../api/storage.html#array" "Fixed integer shape" _parent
     click H "../api/storage.html#dictionary" "Sparse coordinate lookup" _parent
-    click M "../api/storage.html#msb-tree" "MSB = most significant bit: highest binary place values first" _parent
-    click L "../api/storage.html#lsb-tree" "Independent MSB trees selected by coordinate bit depth" _parent
+    click M "../api/storage.html#radix-tree" "MSB = most significant bit: highest binary place values first" _parent
+    click L "../api/storage.html#subtree-radix-tree" "Shared radix tree with shortcuts selected by coordinate bit depth" _parent
 </div>
 <script type="module">
     import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";

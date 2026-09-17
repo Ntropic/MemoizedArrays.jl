@@ -2,6 +2,8 @@
 # Setup, prefill, round-boundary GC and validation are outside timing.
 using JITArrays
 using Random
+using LinearAlgebra
+using Statistics
 
 const Value = Matrix{Float64}
 const CAPACITY = 512
@@ -28,17 +30,6 @@ end
     return JITArrays.slot_publish!(slot, PRECOMPUTED_VALUE)
 end
 
-# Match JITArray's stored representation while excluding cache-miss handling.
-@inline function mapread(map::JITArrays.DictMap{Union{JITArrays.Empty,JITArrays.JITEntry{Value}},N}, key) where N
-    slot = JITArrays.store_lookup(map, key, JITArrays.store_hash(map, key))
-    return slot === nothing ? nothing : JITArrays.slot_entry(slot).value
-end
-@inline function mapinsert!(map::JITArrays.DictMap{Union{JITArrays.Empty,JITArrays.JITEntry{Value}},N}, key) where N
-    stored = JITArrays.JITEntry(PRECOMPUTED_VALUE)
-    slot = JITArrays.store_reserve!(map, key, JITArrays.store_hash(map, key))
-    JITArrays.slot_publish!(slot, stored)
-    return stored.value
-end
 @inline mapdelete!(map, key) = delete!(map, key)
 @inline mapdelete!(map::JITArrays.SparseMap, key) = JITArrays.delete_key!(map, key)
 mapsizehint!(map::Dict) = sizehint!(map, CAPACITY)
@@ -61,38 +52,42 @@ end
 end
 @inline operation!(map, key, ::Val{:reserved}) = mapinsert!(map, key)
 
-# Every implementation writes one result per request, using the same specialized loop.
-function mapoperations!(output, maps, keys, operation)
-    for map in maps, i in eachindex(keys)
-        @inbounds output[i] = operation!(map, keys[i], operation)
+# Consume one matrix element per request without writing an output array.
+function mapoperations!(maps, keys, operation)
+    checksum = 0.0
+    for map in maps, key in keys
+        result = operation!(map, key, operation)
+        checksum += @inbounds result[1, 1]
     end
-    return nothing
+    return checksum
 end
 
-function measured(output, maps, keys, operation)
-    sample = @timed mapoperations!(output, maps, keys, operation)
+function measured(maps, keys, operation)
+    sample = @timed mapoperations!(maps, keys, operation)
     requests = length(maps) * length(keys)
+    @assert sample.value == requests
     return (sample.time * 1e9 / requests, sample.bytes / requests, sample.gctime * 1e9 / requests)
 end
 
-function row(workload, name, samples)
-    times = sort(first.(samples))
-    stats = map(i -> round(times[i]; digits=2), (cld(ROUNDS, 2), 2, ROUNDS - 1))
-    bytes = sort(getindex.(samples, 2))[cld(ROUNDS, 2)]
-    gc = sort(getindex.(samples, 3))[cld(ROUNDS, 2)]
-    println("| ", workload, " | ", name, " | ", stats[1], " | ", stats[2], "–", stats[3],
-        " | ", round(bytes; digits=2), " | ", round(gc; digits=2), " |")
-end
-function tableheader(unit)
-    println("\n| Workload | Implementation | Median ns/", unit, " | p10–p90 ns/", unit, " | Bytes/", unit, " | GC ns/", unit, " |")
-    println("|---|---|---:|---:|---:|---:|")
+formattime(ns) = ns < 1000 ? string(round(ns; digits=1), " ns") : string(round(ns / 1000; digits=1), " µs")
+
+function benchmarktable(results)
+    println("\nMedian time per operation.")
+    names = unique(first.(results))
+    workloads = unique(getindex.(results, 2))
+    println("\n| Implementation | ", join(workloads, " | "), " |")
+    println("|---|", join(fill("---:", length(workloads)), "|"), "|")
+    for name in names
+        timings = Dict((r[2], r[3]) for r in results if r[1] == name)
+        values = [haskey(timings, workload) ? formattime(timings[workload]) : "—" for workload in workloads]
+        println("| ", name, " | ", join(values, " | "), " |")
+    end
 end
 
 hasvalue(cache::AbstractJITArray, key) = isready(cache, key)
 hasvalue(map, key) = mapread(map, key) === PRECOMPUTED_VALUE
 
-function comparemaps(names, makers, warmkeys, requestkeys, operations)
-    output = Vector{Value}(undef, max(length(warmkeys), length(requestkeys)))
+function comparemaps(names, makers, warmkeys, requestkeys, operations, results=Tuple{String,String,Float64}[])
     for (label, operation) in operations
         residents = operation === :threshold ? 48 : CAPACITY
         keys = operation === :read ? requestkeys : operation === :threshold ?
@@ -113,14 +108,13 @@ function comparemaps(names, makers, warmkeys, requestkeys, operations)
         end
         samples = [NTuple{3,Float64}[] for _ in makers]
         for make in makers
-            measured(output, setup(make), keys, Val(operation))
+            measured(setup(make), keys, Val(operation))
         end
         for round in 1:ROUNDS
             GC.gc()
             for i in circshift(collect(eachindex(makers)), round)
                 maps = setup(makers[i])
-                push!(samples[i], measured(output, maps, keys, Val(operation)))
-                @assert all(x -> x === PRECOMPUTED_VALUE, view(output, eachindex(keys)))
+                push!(samples[i], measured(maps, keys, Val(operation)))
                 for map in maps
                     expected = operation === :delete ? 0 : residents
                     if map isa AbstractDict
@@ -140,18 +134,18 @@ function comparemaps(names, makers, warmkeys, requestkeys, operations)
             end
         end
         for i in eachindex(makers)
-            row(label, names[i], samples[i])
+            push!(results, (names[i], label, median(first.(samples[i]))))
         end
     end
-    return nothing
+    return results
 end
 
 # Optional external comparison: using DataStructures; comparetrees(SortedDict, Trie).
-function comparetrees(SortedDict, Trie; maps=(:msbtree, :lsbtree))
-    @assert !isempty(maps) && all(m -> m in (:msbtree, :lsbtree), maps) "Trees: msbtree, lsbtree"
+function comparetrees(SortedDict, Trie; maps=(:radixtree, :subtreetree))
+    @assert !isempty(maps) && all(m -> m in (:radixtree, :subtreetree), maps) "Trees: radixtree, subtreetree"
     println("Julia ", VERSION, "; DataStructures ", pkgversion(parentmodule(SortedDict)), "; ", ROUNDS, " interleaved rounds.")
     domain = (typemin(Int):typemax(Int), typemin(Int):typemax(Int))
-    constructors = (msbtree=JITArrays.MSBRadixMap, lsbtree=JITArrays.LSBRadixMap)
+    constructors = (radixtree=JITArrays.RadixMap, subtreetree=JITArrays.SubtreeRadixMap)
     selected = Tuple(unique(maps))
     trees = map(selected) do storage
         Map = constructors[storage]
@@ -174,29 +168,30 @@ function comparetrees(SortedDict, Trie; maps=(:msbtree, :lsbtree))
             requests = [warm[mod(i * 73, CAPACITY) + 1] for i in 1:32768]
         end
         println("\n### ", label)
-        tableheader("op")
-        comparemaps(names, makers, warm, requests, (("Lookup", :read), ("Insert", :insert)))
+        results = Tuple{String,String,Float64}[]
+        comparemaps(names, makers, warm, requests, (("Lookup", :read), ("Insert", :insert)), results)
         # DataStructures.Trie has no deletion operation.
-        comparemaps(names[1:end-1], makers[1:end-1], warm, requests, (("Delete", :delete), ("Delete + insert", :churn)))
+        comparemaps(names[1:end-1], makers[1:end-1], warm, requests, (("Delete", :delete), ("Delete + insert", :churn)), results)
+        benchmarktable(results)
     end
 end
 
-function benchmark(; maps=(:array, :dict, :msbtree, :lsbtree), caches=(:jit, :exact, :sampled))
-    @assert !isempty(maps) && all(m -> m in (:array, :dict, :msbtree, :lsbtree), maps) "Maps: array, dict, msbtree, lsbtree"
-    @assert !isempty(caches) && all(c -> c in (:jit, :exact, :sampled), caches) "Caches: jit, exact, sampled"
+function benchmark(; maps=(:array, :dict, :radixtree, :subtreetree), caches=(:jit, :exact, :clock, :sieve))
+    @assert !isempty(maps) && all(m -> m in (:array, :dict, :radixtree, :subtreetree), maps) "Maps: array, dict, radixtree, subtreetree"
+    @assert !isempty(caches) && all(c -> c in (:jit, :exact, :clock, :sieve), caches) "Caches: jit, exact, clock, sieve"
     println("Julia ", VERSION, "; ", ROUNDS, " rotated rounds; ", GENERATION_CACHES, " containers per sample.")
-    println("One timed loop, one output write/request. Setup and prefill are untimed; full GC precedes each round. GC during operations is included.")
+    println("One timed loop, one matrix-element checksum/request; no output-array writes. Setup and prefill are untimed; full GC precedes each round. GC during operations is included.")
     println("Insertion/cache miss stores one precomputed matrix. Ready reads and misses use the same loop.")
     for storage in unique(maps)
-        shape = storage in (:msbtree, :lsbtree) ? (8, 8) : nothing
+        shape = storage in (:radixtree, :subtreetree) ? (8, 8) : nothing
         domain = storage === :array ? (4096,) : (typemin(Int):typemax(Int), typemin(Int):typemax(Int))
         options = (; storage=storage === :array ? nothing : storage, block_shape=shape)
-        constructors = (jit=JITArray{Value}, exact=ExactLRUArray{Value}, sampled=SampledLRUArray{Value})
-        names = (jit="JITArray", exact="ExactLRUArray", sampled="SampledLRUArray")
+        constructors = (jit=JITArray{Value}, exact=ExactLRUArray{Value}, clock=SampledLRUArray{Value}, sieve=SampledLRUArray{Value})
+        names = (jit="JITArray", exact="ExactLRUArray", clock="SampledLRUArray (:clock)", sieve="SampledLRUArray (:sieve)")
         selected = Tuple(unique(caches))
         makers = map(selected) do policy
             constructor = constructors[policy]
-            settings = policy === :jit ? options : (; options..., capacity=CAPACITY)
+            settings = policy === :jit ? options : policy === :exact ? (; options..., capacity=CAPACITY) : (; options..., capacity=CAPACITY, policy)
             () -> constructor(value, domain; settings...)
         end
         labels = map(policy -> names[policy], selected)
@@ -205,48 +200,131 @@ function benchmark(; maps=(:array, :dict, :msbtree, :lsbtree), caches=(:jit, :ex
         if storage === :array
             rawlabels, rawmakers = ("Array",), (() -> Vector{Value}(undef, 4096),)
         elseif storage === :dict
-            rawlabels = ("Dict", "DictMap", "DictMap + JITEntry")
-            rawmakers = (() -> Dict{NTuple{2,Int},Value}(),
-                () -> JITArrays.DictMap(Union{JITArrays.Empty,Value}, Val(2), JITArrays.EMPTY),
-                () -> JITArrays.DictMap(Union{JITArrays.Empty,JITArrays.JITEntry{Value}}, Val(2), JITArrays.EMPTY))
+            rawlabels = ("Dict",)
+            rawmakers = (() -> Dict{NTuple{2,Int},Value}(),)
         else
-            Map = storage === :msbtree ? JITArrays.MSBRadixMap : JITArrays.LSBRadixMap
+            Map = storage === :radixtree ? JITArrays.RadixMap : JITArrays.SubtreeRadixMap
             rawlabels = (string(nameof(Map)),)
             rawmakers = (() -> Map(Union{JITArrays.Empty,Value}, domain, shape, JITArrays.EMPTY),)
         end
         println("\n## ", storage)
-        tableheader("request")
+        results = Tuple{String,String,Float64}[]
         comparemaps((rawlabels..., labels...), (rawmakers..., makers...), warm, requests,
-            (("Ready lookup", :read), ("Insertion / cache miss", :insert)))
+            (("Read", :read), ("Initial generation / insertion", :insert)), results)
         bounded = Tuple(findall(!=(:jit), selected))
         boundedlabels = map(i -> labels[i], bounded)
         boundedmakers = map(i -> makers[i], bounded)
         if storage !== :array
             comparemaps((rawlabels..., boundedlabels...), (rawmakers..., boundedmakers...), warm, requests,
-                (("Replacement / miss + eviction", :churn),))
-            comparemaps(rawlabels, rawmakers, warm, requests, (("Delete", :delete),))
+                (("Generate + evict / replace", :churn),), results)
+            if storage !== :dict
+                comparemaps(rawlabels, rawmakers, warm, requests, (("Delete", :delete),), results)
+            end
         elseif !isempty(bounded)
-            comparemaps(boundedlabels, boundedmakers, warm, requests, (("Miss + eviction", :churn),))
+            comparemaps(boundedlabels, boundedmakers, warm, requests, (("Generate + evict", :churn),), results)
         end
-        if storage === :dict
-            comparemaps(rawlabels, rawmakers, warm, requests,
-                (("Insert, reserved", :reserved), ("Replace at load limit", :threshold)))
-        end
+        benchmarktable(results)
     end
 end
 
 function selections(args)
-    options = Dict{Symbol,Tuple{Vararg{Symbol}}}(:maps => (:array, :dict, :msbtree, :lsbtree), :caches => (:jit, :exact, :sampled))
+    options = Dict{Symbol,Tuple{Vararg{Symbol}}}(:maps => (:array, :dict, :radixtree, :subtreetree), :caches => (:jit, :exact, :clock, :sieve))
     for arg in args
         parts = split(arg, '='; limit=2)
         if length(parts) != 2 || !(parts[1] in ("--maps", "--caches"))
-            error("Use --maps=array,dict,msbtree,lsbtree --caches=jit,exact,sampled (default: all)")
+            error("Use --maps=array,dict,radixtree,subtreetree --caches=jit,exact,clock,sieve (default: all)")
         end
         options[Symbol(parts[1][3:end])] = Tuple(Symbol.(split(parts[2], ',')))
     end
     return (; options...)
 end
 
+# LAPACK DSYEVR, matching Julia's default symmetric eigensolver, with caller-owned buffers.
+function matrixeigh!(W, eigenvalues, eigenvectors, support, work, iwork, found, info; query=false)
+    n = size(W, 1)
+    lwork, liwork = query ? (-1, -1) : (length(work), length(iwork))
+    ccall((LinearAlgebra.BLAS.@blasfunc(dsyevr_), LinearAlgebra.LAPACK.libblastrampoline), Cvoid,
+        (Ref{UInt8}, Ref{UInt8}, Ref{UInt8}, Ref{LinearAlgebra.BlasInt},
+         Ptr{Float64}, Ref{LinearAlgebra.BlasInt}, Ref{Float64}, Ref{Float64},
+         Ref{LinearAlgebra.BlasInt}, Ref{LinearAlgebra.BlasInt}, Ref{Float64}, Ptr{LinearAlgebra.BlasInt},
+         Ptr{Float64}, Ptr{Float64}, Ref{LinearAlgebra.BlasInt}, Ptr{LinearAlgebra.BlasInt},
+         Ptr{Float64}, Ref{LinearAlgebra.BlasInt}, Ptr{LinearAlgebra.BlasInt}, Ref{LinearAlgebra.BlasInt},
+         Ref{LinearAlgebra.BlasInt}, Clong, Clong, Clong),
+        'V', 'A', 'U', n, W, stride(W, 2), 0.0, 0.0, 0, 0, -1.0, found,
+        eigenvalues, eigenvectors, stride(eigenvectors, 2), support, work, lwork, iwork, liwork, info, 1, 1, 1)
+    LinearAlgebra.LAPACK.chklapackerror(info[])
+    return nothing
+end
+
+function matrixoperations!(inputs, C, W, eigenvalues, eigenvectors, support, work, iwork, found, info, ::Val{operation}) where operation
+    checksum = 0.0
+    for i in 1:4096
+        A, B = @inbounds inputs[mod1(i, length(inputs))]
+        if operation === :addition
+            C .= A .+ B
+            checksum += @inbounds C[1]
+        elseif operation === :product
+            mul!(C, A, B)
+            checksum += @inbounds C[1]
+        else
+            copyto!(W, A)
+            matrixeigh!(W, eigenvalues, eigenvectors, support, work, iwork, found, info)
+            checksum += @inbounds eigenvalues[1]
+        end
+    end
+    return checksum
+end
+
+"""Benchmark supplied-output matrix operations at powers of two from 2 through `maxsize` (default 16)."""
+function benchmarkmatrices(maxsize::Int=16)
+    maxsize >= 2 || throw(ArgumentError("maximum matrix size must be at least 2"))
+    BLAS.set_num_threads(1)
+    println("\n## Matrix operations with supplied outputs")
+    println("\n| Size | Addition | Multiplication | eigh |")
+    println("|---|---:|---:|---:|")
+    rng = Xoshiro(2026)
+    for power in 1:floor(Int, log2(maxsize))
+        n = 2^power
+        inputs = [(randn(rng, n, n), randn(rng, n, n)) for _ in 1:64]
+        C, W, eigenvalues, eigenvectors = zeros(n,n), zeros(n,n), zeros(n), zeros(n,n)
+        support = Vector{LinearAlgebra.BlasInt}(undef, 2n)
+        work, iwork = zeros(1), zeros(LinearAlgebra.BlasInt, 1)
+        found, info = Ref{LinearAlgebra.BlasInt}(0), Ref{LinearAlgebra.BlasInt}(0)
+        matrixeigh!(W, eigenvalues, eigenvectors, support, work, iwork, found, info; query=true)
+        resize!(work, Int(work[1]))
+        resize!(iwork, Int(iwork[1]))
+        buffers = (inputs, C, W, eigenvalues, eigenvectors, support, work, iwork, found, info)
+        operations = (Val(:addition), Val(:product), Val(:eigh))
+        samples = [Float64[] for _ in operations]
+        bytes = [Float64[] for _ in operations]
+        for operation in operations
+            matrixoperations!(buffers..., operation)
+        end
+        A, B = inputs[end]
+        @assert found[] == n
+        @assert eigenvectors * Diagonal(eigenvalues) * eigenvectors' ≈ Matrix(Symmetric(A))
+        @assert eigenvectors' * eigenvectors ≈ I
+        @assert eigenvalues ≈ eigvals(Symmetric(A))
+        matrixoperations!(buffers..., Val(:addition))
+        @assert C ≈ A + B
+        matrixoperations!(buffers..., Val(:product))
+        @assert C ≈ A * B
+        for round in 1:ROUNDS
+            GC.gc()
+            for offset in 0:2
+                j = mod1(round + offset, 3)
+                sample = @timed matrixoperations!(buffers..., operations[j])
+                @assert isfinite(sample.value)
+                push!(samples[j], sample.time * 1e9 / 4096)
+                push!(bytes[j], sample.bytes / 4096)
+            end
+        end
+        @assert all(iszero, median.(bytes))
+        println("| ", n, "×", n, " | ", join(formattime.(median.(samples)), " | "), " |")
+    end
+end
+
 if abspath(PROGRAM_FILE) == @__FILE__
     benchmark(; selections(ARGS)...)
+    benchmarkmatrices()
 end

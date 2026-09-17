@@ -30,6 +30,7 @@ end
 
 export AbstractJITArray, JITArray, LRUArray, ExactLRUArray, SampledLRUArray, generate!
 export SparseJITArray, SparseLRUArray
+export getready
 
 """Cache interface parameterized by value type, dimension count and storage type."""
 abstract type AbstractJITArray{ValueType,N,M} <: AbstractArray{ValueType,N} end

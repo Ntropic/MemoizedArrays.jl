@@ -10,13 +10,17 @@ end
 replacementallocation(cache, key) = @allocated cache[key]
 
 @testset "Map/cache integration" begin
-    for storage in (:array, :dict, :msbtree, :lsbtree), T in (JITArray, ExactLRUArray, SampledLRUArray)
+    for storage in (:array, :dict, :radixtree, :subtreetree), T in (JITArray, ExactLRUArray, SampledLRUArray)
         calls = Ref(0)
         generator = i -> (calls[] += 1; i)
         domain = storage === :array ? (6,) : (-1:6,)
         options = storage === :array ? (;) : storage === :dict ? (; storage) : (; storage, block_shape=(8,))
         capacity = T === JITArray ? (;) : (; capacity=2)
         cache = T{Int}(generator, domain; options..., capacity...)
+        if T !== JITArray
+            @test !hasfield(typeof(cache), :domain)
+        end
+        @test size(cache) == (storage === :array ? (6,) : (8,))
         @test !isready(cache, 1)
         @test (@inferred cache[1]) == cache[1] == 1
         @test readyallocations(cache) == 0
@@ -76,6 +80,64 @@ end
     @test_throws Base.CanonicalIndexError (cache[1] = 0)
 end
 
+@testset "Shaped ArrayMap" begin
+    for T in (JITArray, ExactLRUArray, SampledLRUArray), shape in ((4,), (2, 3), (2, 3, 4))
+        options = T === JITArray ? (;) : (; capacity=1)
+        cache = T{Int}((key...) -> LinearIndices(shape)[key...], shape; options...)
+        @test size(cache) == cache.map.shape == shape
+        @test cache.map.reference.mem isa Memory
+        @test cache.map.strides == Base.size_to_strides(1, shape...)
+        @test JA.cache_key(cache, prod(shape)) === prod(shape)
+        @test JA.cache_key(cache, shape) === prod(shape)
+        @test all(JA.slotaddress(cache.map, Tuple(k)) == LinearIndices(shape)[k] for k in CartesianIndices(shape))
+        @test cache[shape...] == cache[prod(shape)] == prod(shape)
+        @test cache[1] == 1
+        @test cache[shape...] == prod(shape)
+        invalid = (shape[1] + 1, Base.tail(shape)...)
+        @test_throws BoundsError cache[invalid...]
+    end
+end
+
+@testset "Ready-only getter" begin
+    calls = Ref(0)
+    cache = JITArray{Vector{Int}}((i, j, k) -> (calls[] += 1; [i, j, k]), 2, 3, 4)
+    value = cache[2, 3, 4]
+    @test (@inferred getready(cache, 2, 3, 4)) === getready(cache, 24) === value
+    @test calls[] == 1
+    @test getready(cache, 2, 3, 4, 1) === value
+    @test_throws BoundsError getready(cache, 25)
+    @test_throws BoundsError getready(cache, 3, 1, 1)
+end
+
+@testset "ArrayMap identity sentinel" begin
+    matrix = ones(4, 4)
+    for value in (0, false, nothing, matrix, view(matrix, 1:2, 1:2))
+        calls = Ref(0)
+        cache = JITArray{typeof(value)}((i, j) -> (calls[] += 1; value), 2, 3)
+        @test all(slot -> slot === cache.map.empty, cache.map.reference.mem)
+        @test isconcretetype(eltype(cache.map.reference.mem))
+        @test !isready(cache, 2, 3)
+        @test cache[2, 3] === cache[6] === getready(cache, 2, 3) === value
+        @test calls[] == 1 && isready(cache, 2, 3) && !isready(cache, 1)
+        @test readyallocations(cache) == 0
+    end
+    failing = JITArray{Int}(_ -> 0.5, 1)
+    @test_throws InexactError failing[1]
+    @test !isready(failing, 1)
+end
+
+@testset "Batch generator coordinates" begin
+    coordinates = [(2, 1, 4), (1, 3, 2), (2, 1, 4)]
+    for T in (JITArray, ExactLRUArray, SampledLRUArray), requests in (coordinates, CartesianIndex.(coordinates))
+        calls = NTuple{3,Int}[]
+        options = T === JITArray ? (;) : (; capacity=2)
+        cache = T{NTuple{3,Int}}((key...) -> (push!(calls, key); key), 2, 3, 4; options...)
+        @test generate!(cache, requests) === cache
+        @test calls == coordinates[1:2]
+        @test cache[2, 1, 4] == (2, 1, 4) && cache[1, 3, 2] == (1, 3, 2)
+    end
+end
+
 @testset "Values and direct generation" begin
     for T in (JITArray, ExactLRUArray, SampledLRUArray)
         options = T === JITArray ? (;) : (; capacity=1)
@@ -99,10 +161,10 @@ end
         @test dependent[1] == 12
     end
     # Reuse the cache entry across map families without changing returned value objects.
-    for C in (ExactLRUArray, SampledLRUArray), storage in (:array, :dict, :msbtree, :lsbtree)
+    for C in (ExactLRUArray, SampledLRUArray), storage in (:array, :dict, :radixtree, :subtreetree)
         domain = storage === :array ? (1024,) : (1:1024,)
         options = (; storage=storage === :array ? nothing : storage,
-            block_shape=storage in (:msbtree, :lsbtree) ? (8,) : nothing)
+            block_shape=storage in (:radixtree, :subtreetree) ? (8,) : nothing)
         cache = C{Vector{Int}}(i -> [i], domain; capacity=1, options...)
         retained = cache[1]
         stored = JA.entry(cache, JA.cache_key(cache, 1))
@@ -116,15 +178,6 @@ end
         replacementallocation(cache, 2)
         @test replacementallocation(cache, 3) == 0
     end
-    # A reused sampled entry must not revive duplicate candidates from its old residency.
-    cache = SampledLRUArray{Int}(identity, 4; capacity=1)
-    cache[1]
-    stored = JA.entry(cache, 1)
-    JA.sampled_pooladd!(cache, stored, UInt64(10))
-    JA.sampled_pooladd!(cache, stored, UInt64(10))
-    @test cache[2] == 2
-    @test JA.entry(cache, 2) === stored
-    @test all(i -> cache.versions[i] != stored.version, 1:cache.pooled)
     # Nested generation can resize the dictionary before the outer value is stored.
     nested = JITArray{Int}(i -> i == 0 ? sum(nested[k] for k in 1:60) : i, 0:60)
     @test nested[0] == sum(1:60)
@@ -136,7 +189,7 @@ end
     @test colliding[keys[2]] == keys[2]
     @test colliding.map.count == 2
     # Nested eviction can detach the branch saved for an outer tree miss.
-    for storage in (:msbtree, :lsbtree)
+    for storage in (:radixtree, :subtreetree)
         pruning = ExactLRUArray{Int}(i -> i == 40 ? pruning[512] + i : i, 0:1024;
             capacity=2, storage, block_shape=(8,))
         pruning[32], pruning[36]
@@ -149,45 +202,93 @@ end
 
 @testset "Exact LRU ordering" begin
     cache = ExactLRUArray{Int}(identity, 6; capacity=3)
+    @test eltype(cache.map.reference.mem) === JA.entrytype(cache)
+    @test cache.map.empty === cache.root
+    @test fieldtype(JA.entrytype(cache), :previous) === JA.entrytype(cache)
+    @test cache.root.next === cache.root.previous === cache.root
     order = Int[]
     for key in (1, 2, 3, 2, 1, 4, 4, 3, 5, 6, 1)
         filter!(!=(key), order)
         push!(order, key)
         length(order) > 3 && popfirst!(order)
         @test cache[key] == key
-        actual, previous, entry = Int[], nothing, cache.oldest
-        while entry !== nothing && length(actual) <= 3
+        actual, previous, entry = Int[], cache.root, cache.root.next
+        while entry !== cache.root && length(actual) <= 3
             @test entry.previous === previous
             @test JA.entry(cache, entry.key) === entry
             push!(actual, entry.key)
             previous, entry = entry, entry.next
         end
         @test actual == order
-        @test cache.newest === previous
+        @test cache.root.previous === previous
         @test cache.count == length(order)
         @test findall(i -> isready(cache, i), 1:6) == sort(order)
     end
 end
 
-@testset "Sampled eviction and counter" begin
-    cache = SampledLRUArray{Int}(identity, 64; capacity=4)
-    for key in 1:64
-        @test cache[key] == key
-    end
-    @test cache.counter == 64
-    @test cache.ready == count(i -> isready(cache, i), 1:64) == 4
-    cache = SampledLRUArray{Int}(identity, 6; capacity=6)
-    @test generate!(cache, [1, 2, 1]) === cache
-    @test cache.counter == 3
-    @test JA.entry(cache, 1).accessed == JA.entry(cache, 2).accessed
-    @test copy(view(cache, 2:4)) == [2, 3, 4]
-    @test cache.counter == 6
-    @test generate!(cache, Int[]) === cache
-    @test cache.counter == 6
-    cache.counter = UInt64(typemax(UInt32))
-    @test cache[1] == 1
-    @test cache.counter == UInt64(typemax(UInt32)) + 1
-end
-
 include("SparseJITArrays_test.jl")
 include("Maps_test.jl")
+
+@testset "Approximate LRU specializations" begin
+    @test_throws ArgumentError SampledLRUArray{Int}(identity,4;capacity=1,policy=:sampled)
+    @test_throws ArgumentError LRUArray{Int}(identity,4;capacity=1,policy=:sample5)
+    for policy in (:clock,:sieve)
+        cache = SampledLRUArray{Int}(identity, [64]; capacity=4, policy)
+        @test cache isa SampledLRUArray && typeof(cache).parameters[5] === policy
+        @test !hasfield(typeof(cache), :domain) && !hasfield(typeof(cache), :counter)
+        valid = true
+        for (request, k) in enumerate([1:32; 1:8; 33:64])
+            valid &= cache[k] == k && cache.count == count(i -> isready(cache, i), 1:64) == min(request, 4)
+        end
+        @test valid
+        @test SampledLRUArray{Int}(() -> 7; capacity=1, policy)[] == 7
+        @test SampledLRUArray{Int}((4,), 1, identity; policy)[2] == 2
+        @test_throws ArgumentError SampledLRUArray{Int}(identity,4;capacity=0,policy)
+        sparse = SparseLRUArray{Int}(identity; ndims=1, capacity=2, policy)
+        @test sparse[-1] == -1
+        @test copy(view(cache,1:3)) == [1,2,3]
+        for storage in (:array,:dict,:radixtree,:subtreetree)
+            options = storage === :array ? (;) : storage === :dict ? (;storage) : (;storage,block_shape=(8,))
+            domain = storage === :array ? (1024,) : (0:1024,)
+            nested = SampledLRUArray{Int}(i -> i == 40 ? nested[512] + i : i, domain; capacity=2, policy, options...)
+            nested[32]; nested[36]
+            @test nested[40] == 552
+            @test count(i -> isready(nested,i), (32,36,40,512)) == 2
+            reused = SampledLRUArray{Vector{Int}}(i -> [i],domain;capacity=1,policy,options...)
+            retained = reused[1]
+            stored = JA.entry(reused,JA.cache_key(reused,1))
+            @test reused[512] == [512] && retained == [1]
+            @test JA.entry(reused,JA.cache_key(reused,512)) === stored && !isready(reused,1)
+        end
+        converted = SampledLRUArray{Float64}(identity,4;capacity=1,policy)
+        @test (@inferred converted[1]) === 1.0
+        readyallocations(converted)
+        @test readyallocations(converted) == 0
+        replacementallocation(converted,2)
+        @test replacementallocation(converted,3) == 0
+    end
+    sieve = SampledLRUArray{Int}(identity,8;capacity=3,policy=:sieve)
+    generate!(sieve,[1,2,3]); sieve[1]; sieve[4]
+    @test isready(sieve,1) && !isready(sieve,2)
+    sieve[5]
+    @test !isready(sieve,3) && isready(sieve,5)
+    clock = SampledLRUArray{Int}(identity,8;capacity=3)
+    generate!(clock,[1,2,3]); clock[4]
+    @test !isready(clock,1) && isready(clock,4)
+end
+
+@testset "Preallocated entries" begin
+    for make in (()->ExactLRUArray{Int}(identity,8;capacity=3),
+                 ()->SampledLRUArray{Int}(identity,8;capacity=3,policy=:clock),
+                 ()->SampledLRUArray{Int}(identity,8;capacity=3,policy=:sieve))
+        replacementallocation(make(),1)
+        cache=make()
+        entries=cache isa ExactLRUArray ? cache.entries : cache.active
+        @test cache.count == 0 && !isready(cache,1)
+        for k in 1:3
+            @test replacementallocation(cache,k) == 0
+            @test JITArrays.entry(cache,k) === entries[k]
+        end
+        @test replacementallocation(cache,4) == 0 && cache.count == 3
+    end
+end

@@ -10,16 +10,19 @@ mutable struct HashRecord{T,N}
     value::T
 end
 
-mutable struct DictMap{T,N} <: SparseMap{T,N}
+mutable struct DictMap{T,N,D,E} <: SparseMap{T,N}
     table::Memory{Union{HashMarker,HashRecord{T,N}}}
     count::Int
     used::Int
     insertions::UInt
-    const empty::Empty
+    const empty::E
+    const domain::D
 end
 
 hash_table(::Type{T}, ::Val{N}, count::Int) where {T,N} = empty_map(Union{HashMarker,HashRecord{T,N}}, (count,), HASH_EMPTY)
-DictMap(::Type{T}, ::Val{N}, empty::Empty) where {T,N} = DictMap{T,N}(hash_table(T, Val(N), 64), 0, 0, UInt(0), empty)
+DictMap(::Type{T}, ::Val{N}, empty) where {T,N} = DictMap(T, int_axes(N), empty)
+
+DictMap(::Type{T}, domain::NTuple{N,Any}, empty) where {T,N} = DictMap{T,N,typeof(domain),typeof(empty)}(hash_table(T, Val(N), 64), 0, 0, UInt(0), empty, domain)
 
 @inline store_hash(::DictMap, key) = hash(key)
 @inline slot_entry(slot::HashRecord) = slot.value
@@ -28,8 +31,9 @@ store_retain!(::DictMap, slot::HashRecord) = nothing
 
 # Find a record or the first reusable slot in its probe chain.
 @inline function hash_find(table::Memory, key, hashed::UInt)
-    mask = UInt(length(table) - 1)
-    address = Int(hashed & mask) + 1
+    # Power-of-two table sizes keep masked signed indices within the table.
+    mask = length(table) - 1
+    address = ((hashed % Int) & mask) + 1
     vacant = 0
     while true
         entry = @inbounds table[address]
@@ -43,7 +47,7 @@ store_retain!(::DictMap, slot::HashRecord) = nothing
         elseif entry.hash == hashed && entry.key == key
             return entry, address
         end
-        address = Int(UInt(address) & mask) + 1
+        address = (address & mask) + 1
     end
 end
 

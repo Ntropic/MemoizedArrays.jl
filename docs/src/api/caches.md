@@ -26,8 +26,13 @@ julia> a[2, 3]
 
 Keep all successfully generated values for reuse.
 
+For ArrayMap-backed JITArray, `getready(cache, indices...)` reads a value that the caller
+has already generated. It skips the presence check and generation path. Bounds checks
+remain unless called with `@inbounds`.
+
 ```@docs
 JITArray
+getready
 ```
 
 ## [Bounded caching](@id bounded)
@@ -42,16 +47,22 @@ LRUArray
 
 | Policy | Behavior |
 |---|---|
-| `:sampled` (default) | Samples resident entries and evicts an approximately oldest value; cheaper ready reads. |
 | `:exact` | Evicts the least recently accessed value; updates its access order on each read. |
+| `:clock` (default) | Scans a circular resident vector, giving visited entries a second chance. |
+| `:sieve` | Scans insertion order; reads mark entries as visited without reordering. |
 
 ```@docs
 SampledLRUArray
 ExactLRUArray
 ```
 
-### Sampled-cache recency
+### Approximate LRU
 
-A per-cache `UInt64` counter tracks accesses. Each scalar access advances it by one.
-Batch requests share one stamp and advance the counter by their request count, including duplicates.
-Empty batches leave the counter unchanged.
+`SampledLRUArray(...; policy=:clock)` and `SampledLRUArray(...; policy=:sieve)` are specializations
+of the same cache type. Reads set a visited bit; neither policy uses access counters or random samples.
+CLOCK stores residents in a circular vector; SIEVE keeps insertion order in a linked list.
+
+### References
+
+- **CLOCK:** F. J. Corbató, [*A Paging Experiment with the Multics System*](https://multicians.org/paging-experiment.pdf), in *In Honor of Philip M. Morse*, MIT Press, 1969, pp. 217–228. The circular scan gives referenced entries a second chance.
+- **SIEVE:** Yazhuo Zhang, Juncheng Yang, Yao Yue, Ymir Vigfusson, and K. V. Rashmi, [*SIEVE is Simpler than LRU: an Efficient Turn-Key Eviction Algorithm for Web Caches*](https://www.usenix.org/conference/nsdi24/presentation/zhang-yazhuo), NSDI 2024. Hits mark entries visited; the eviction hand scans insertion order and clears visited bits.

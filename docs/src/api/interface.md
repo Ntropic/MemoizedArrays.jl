@@ -36,6 +36,4 @@ generate!
 ```
 
 Keep batch requests unchanged until completion. A bounded cache may evict earlier batch results before
-the batch finishes. Sampled-cache bulk selections and generation batches share one timestamp; the access
-counter advances once by the number of requests, including repeated keys. Individual view reads update
-recency separately.
+the batch finishes. Each requested key applies the selected eviction policy, including repeated keys.

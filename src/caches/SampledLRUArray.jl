@@ -1,214 +1,161 @@
-# Sampled LRU cache, entry and constructors; tracks recency and selects eviction victims.
+# Approximate LRU caches: CLOCK scans resident slots; SIEVE scans insertion order.
+# Policy and field layouts are type parameters; reads only mark entries as visited.
 
-# Sampled LRU with candidate retention: Psounis & Prabhakar (2002), https://doi.org/10.1109/TNET.2002.801414
-# Five samples and a persistent 16-candidate pool follow https://github.com/redis/redis/blob/8.2/src/evict.c.
-
-mutable struct SampledLRUEntry{V,Key} <: AbstractEntry{V}
+mutable struct ClockEntry{V,Key} <: AbstractEntry{V}
     key::Key
-    slot::Int
-    version::UInt64
-    accessed::UInt64
+    visited::Bool
     value::V
-    SampledLRUEntry{V,Key}(key, value) where {V,Key} = new{V,Key}(key, 0, UInt64(0), UInt64(0), value)
+    ClockEntry{V,Key}() where {V,Key} = new{V,Key}()
 end
 
-"""
-    SampledLRUArray{V}(generator, dims...; capacity, kwargs...)
+mutable struct SieveEntry{V,Key} <: AbstractEntry{V}
+    key::Key
+    previous::Union{Nothing,SieveEntry{V,Key}}
+    next::Union{Nothing,SieveEntry{V,Key}}
+    visited::Bool
+    value::V
+    SieveEntry{V,Key}() where {V,Key} = new{V,Key}()
+end
 
-Cache values with sampled LRU eviction. Accept sizes or coordinate ranges.
-Sparse storage: `:dict` (default), `:msbtree`, `:lsbtree`; trees require `block_shape`.
-"""
-mutable struct SampledLRUArray{V,N,M,D,G,Key} <: AbstractJITArray{V,N,M}
+"""`SampledLRUArray{V}(generator, dims...; capacity, policy=:clock, kwargs...)`: policies `:clock` (default), `:sieve`."""
+mutable struct SampledLRUArray{V,N,M,G,Policy,E,A,L,H} <: AbstractJITArray{V,N,M}
+    const capacity::Int
+    count::Int
+    const active::A
+    oldest::L
+    newest::L
+    hand::H
     const map::M
-    const domain::D
     const generator::G
-    const active::Vector{SampledLRUEntry{V,Key}}
-    ready::Int
-    const pool::Vector{Union{Nothing,SampledLRUEntry{V,Key}}}
-    const ages::Vector{UInt64}
-    const versions::Vector{UInt64}
-    pooled::Int
-    rng::UInt64
-    divisor::UInt64
-    reciprocal::UInt64
-    counter::UInt64
 end
 
-function SampledLRUArray{V}(generator, domain::VT{N,T}; capacity::Int,
-    storage=nothing, block_shape=nothing) where {V,N,T<:Union{Int,AbstractUnitRange{Int}}}
+function SampledLRUArray{V}(generator::G, domain::VT{N,T}; capacity::Int, policy::Symbol=:clock,
+    storage=nothing, block_shape=nothing) where {V,G,N,T<:Union{Int,AbstractUnitRange{Int}}}
+    capacity < 1 && throw(ArgumentError("capacity must be positive"))
     storage = domain_storage(domain, storage)
     @astuple length(domain) domain
-    return construct(SampledLRUArray{V}, domain, generator, capacity, storage, block_shape)
+    domain = axis_domain(domain, storage)
+    Key = entry_keytype(domain, storage)
+    if policy === :clock
+        E = ClockEntry{V,Key}
+        active, oldest, newest, hand = preallocate(E, capacity), nothing, nothing, 1
+        L, H = Nothing, Int
+    elseif policy === :sieve
+        E = SieveEntry{V,Key}
+        active, oldest, newest, hand = preallocate(E, capacity), nothing, nothing, nothing
+        L = H = Union{Nothing,E}
+    else
+        throw(ArgumentError("unknown approximate LRU policy $policy; use :clock or :sieve"))
+    end
+    map = make_map(Union{Empty,E}, domain, storage, block_shape)
+    return SampledLRUArray{V,length(domain),typeof(map),G,policy,E,typeof(active),L,H}(
+        capacity, 0, active, oldest, newest, hand, map, generator)
 end
 
 SampledLRUArray{V}(generator, dims::Int...; kwargs...) where V = SampledLRUArray{V}(generator, dims; kwargs...)
-
 SampledLRUArray{V}(generator, axis::AbstractUnitRange{Int}, axes::AbstractUnitRange{Int}...; kwargs...) where V = SampledLRUArray{V}(generator, (axis, axes...); kwargs...)
-
 SampledLRUArray{V}(domain::VT{N,T}, capacity::Int, generator::Function; kwargs...) where {V,N,T} = SampledLRUArray{V}(generator, domain; capacity, kwargs...)
+@inline entrytype(::SampledLRUArray{V,N,M,G,P,E}) where {V,N,M,G,P,E} = E
 
-function construct(::Type{SampledLRUArray{V}}, input::Tuple, generator::G, capacity::Int,
-    storage, block) where {V,G}
-    capacity < 1 && throw(ArgumentError("capacity must be positive"))
-    domain = axis_domain(input, storage)
-    Key = entry_keytype(domain, storage)
-    E = SampledLRUEntry{V,Key}
-    map = make_map(Union{Empty,E}, domain, storage, block)
-    return SampledLRUArray{V,length(domain),typeof(map),typeof(domain),G,Key}(
-        map, domain, generator, Vector{E}(undef, capacity),
-        0, fill!(Vector{Union{Nothing,E}}(undef, 16), nothing), zeros(UInt64, 16), zeros(UInt64, 16), 0,
-        0x123456789abcdef0, 0, 0, 0)
-end
-
-# Resolve scalar timestamps only at access/publication; batches already carry their stamp.
-@inline accessstamp(cache, ::Nothing) = (cache.counter += UInt64(1))
-@inline accessstamp(cache, stamp::UInt64) = stamp
-@inline batchstamp(cache::SampledLRUArray, count::Int) = (cache.counter += UInt64(count))
-
-# Record access using the access counter; skip unchanged timestamps.
-@inline function sampled_touch(cache, entry::SampledLRUEntry, stamp)
-    now = accessstamp(cache, stamp)
-    previous = entry.accessed
-    if previous != now
-        entry.accessed = now
-    end
-    return entry.value
-end
-
-function policy_add!(cache, entry::SampledLRUEntry, stamp)
-    entry.accessed = accessstamp(cache, stamp)
-    cache.ready += 1
-    entry.slot = cache.ready
-    @inbounds cache.active[entry.slot] = entry
-    return nothing
-end
-
-function evict!(cache::SampledLRUArray)
-    entry = sampled_victim!(cache)
-    sampled_detach!(cache, entry)
-    delete_key!(cache.map, entry.key)
-    return entry
-end
-
-# Remove a sampled resident from the compact active array.
-function sampled_detach!(cache, entry::SampledLRUEntry)
-    @inbounds last = cache.active[cache.ready]
-    if last !== entry
-        @inbounds cache.active[entry.slot] = last
-        last.slot = entry.slot
-    end
-    cache.ready -= 1
-    # Invalidate candidates from this residency without scanning the pool.
-    entry.version += UInt64(1)
-    return nothing
-end
-
-# Advance the cache-local sampler for eviction.
-@inline function sampled_random!(cache)
-    x = cache.rng
-    x ⊻= x << 13
-    x ⊻= x >> 7
-    x ⊻= x << 17
-    cache.rng = x
-    return x
-end
-
-# Exact remainder, using a reciprocal cached when the resident count changes.
-@inline function sample_remainder(x::UInt64, n::UInt64, reciprocal::UInt64)
-    q = UInt64(widemul(x, reciprocal) >>> 64)
-    r = x - q * n
-    if r >= n
-        r -= n
-    end
-    return r
-end
-
-# Full pool: discard its minimum and shift only the affected prefix.
-@inline function sampled_pooladd!(c, e, age)
-    @inbounds begin
-        if c.pooled == 16
-            if age <= c.ages[1]
-                return nothing
-            end
-            i = 1
-            while i < 16
-                if c.ages[i + 1] > age
-                    break
-                end
-                c.ages[i] = c.ages[i + 1]
-                c.versions[i] = c.versions[i + 1]
-                c.pool[i] = c.pool[i + 1]
-                i += 1
-            end
-        else
-            i = c.pooled + 1
-            while i > 1
-                if c.ages[i - 1] <= age
-                    break
-                end
-                c.ages[i] = c.ages[i - 1]
-                c.versions[i] = c.versions[i - 1]
-                c.pool[i] = c.pool[i - 1]
-                i -= 1
-            end
-            c.pooled += 1
-        end
-        c.ages[i] = age
-        c.versions[i] = e.version
-        c.pool[i] = e
-    end
-    return nothing
-end
-
-# Sample resident entries and pop the oldest surviving candidate.
-function sampled_victim!(c)
-    n = UInt64(c.ready)
-    if c.divisor != n
-        c.divisor = n
-        c.reciprocal = typemax(UInt64) ÷ n
-    end
+# CLOCK: F. J. Corbató, A Paging Experiment with the Multics System (1969).
+# https://multicians.org/paging-experiment.pdf
+function victim!(cache::SampledLRUArray{V,N,M,G,:clock}) where {V,N,M,G}
     @inbounds while true
-        now = c.counter
-        for _ in 1:5
-            index = Int(sample_remainder(sampled_random!(c), n, c.reciprocal)) + 1
-            e = c.active[index]
-            last = e.accessed
-            sampled_pooladd!(c, e, now >= last ? now - last : UInt64(0))
+        index = cache.hand
+        cache.hand = index == cache.capacity ? 1 : index + 1
+        stored = cache.active[index]
+        if !stored.visited
+            return index
         end
-        while c.pooled > 0
-            e = c.pool[c.pooled]::eltype(c.active)
-            version = c.versions[c.pooled]
-            c.pool[c.pooled] = nothing
-            c.pooled -= 1
-            if e.version == version
-                return e
-            end
-        end
+        stored.visited = false
     end
 end
 
-@inline entrytype(::SampledLRUArray{V,N,M,D,G,Key}) where {V,N,M,D,G,Key} = SampledLRUEntry{V,Key}
-
-@inline function cacheget(cache::SampledLRUArray{V,N,M,D,G,Key}, key, stamp=nothing, indices=nothing) where {V,N,M,D,G,Key}
+@inline function cacheget(cache::SampledLRUArray{V,N,M,G,:clock,E}, key, indices=nothing) where {V,N,M,G,E}
     routing = store_hash(cache.map, key)
     slot, hint = prepare(cache.map, key, routing)
     if slot !== nothing
         stored = preparedentry(slot, hint)
-        if stored isa SampledLRUEntry{V,Key}
-            return sampled_touch(cache, stored, stamp)
+        if stored isa E
+            if !stored.visited
+                stored.visited = true
+            end
+            return stored.value
         end
     end
-    value = convert(V, cache.generator(generator_indices(cache, key, indices)...))
-    if cache.ready == length(cache.active)
-        stored = evict!(cache)
-        stored.key = key
-        stored.value = value
+    generated = cache.generator(generator_indices(cache, key, indices)...)
+    value = generated isa V ? generated : convert(V, generated)
+    if cache.count == cache.capacity
+        index = victim!(cache)
+        @inbounds stored = cache.active[index]
+        delete_key!(cache.map, stored.key)
+        stored.key, stored.value, stored.visited = key, value, true
     else
-        stored = SampledLRUEntry{V,Key}(key, value)
+        @inbounds stored = cache.active[cache.count + 1]
+        stored.key, stored.value, stored.visited = key, value, true
+        cache.count += 1
     end
     slot = reserve!(cache.map, key, routing, slot, hint)
     store_retain!(cache.map, slot)
     slot_publish!(slot, stored)
-    policy_add!(cache, stored, stamp)
-    return stored.value
+    return value
+end
+
+# SIEVE: Zhang et al., SIEVE is Simpler than LRU (NSDI 2024).
+# https://www.usenix.org/conference/nsdi24/presentation/zhang-yazhuo
+function victim!(cache::SampledLRUArray{V,N,M,G,:sieve}) where {V,N,M,G}
+    stored = cache.hand === nothing ? cache.oldest : cache.hand
+    while stored.visited
+        stored.visited = false
+        stored = stored.next === nothing ? cache.oldest : stored.next
+    end
+    cache.hand = stored.next
+    return stored
+end
+
+@inline function cacheget(cache::SampledLRUArray{V,N,M,G,:sieve,E}, key, indices=nothing) where {V,N,M,G,E}
+    routing = store_hash(cache.map, key)
+    slot, hint = prepare(cache.map, key, routing)
+    if slot !== nothing
+        stored = preparedentry(slot, hint)
+        if stored isa E
+            if !stored.visited
+                stored.visited = true
+            end
+            return stored.value
+        end
+    end
+    generated = cache.generator(generator_indices(cache, key, indices)...)
+    value = generated isa V ? generated : convert(V, generated)
+    if cache.count == cache.capacity
+        stored = victim!(cache)
+        delete_key!(cache.map, stored.key)
+        if stored.previous === nothing
+            cache.oldest = stored.next
+        else
+            stored.previous.next = stored.next
+        end
+        if stored.next === nothing
+            cache.newest = stored.previous
+        else
+            stored.next.previous = stored.previous
+        end
+        stored.key, stored.value, stored.visited = key, value, false
+        stored.previous, stored.next = cache.newest, nothing
+    else
+        @inbounds stored = cache.active[cache.count + 1]
+        stored.key, stored.value, stored.visited = key, value, false
+        stored.previous, stored.next = cache.newest, nothing
+        cache.count += 1
+    end
+    if cache.newest === nothing
+        cache.oldest = stored
+    else
+        cache.newest.next = stored
+    end
+    cache.newest = stored
+    slot = reserve!(cache.map, key, routing, slot, hint)
+    store_retain!(cache.map, slot)
+    slot_publish!(slot, stored)
+    return value
 end
