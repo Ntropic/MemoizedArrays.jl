@@ -1,5 +1,9 @@
 /Manifest.toml
 /docs/Manifest.toml
 /docs/build/
+/experiments/
+/later/
+/spec/
+/proposals.md
 *.jl.cov
 *.jl.mem
