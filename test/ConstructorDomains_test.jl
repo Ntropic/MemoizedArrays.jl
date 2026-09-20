@@ -5,7 +5,7 @@
     @test isunbound(:)
     @test !isunbound(3) && !isunbound(-2:2)
     for (C, options) in ((JITArray, (;)), (ExactLRUArray, (; capacity=2)),
-                         (SampledLRUArray, (; capacity=2)))
+                         (ApproxLRUArray, (; capacity=2)))
         @test_throws MethodError C{Int}(identity; options...)
         for domain in ((3, 4), (1:3, 1:4), [3, 4], [1:3, 1:4], (-1:1, 4), Any[-1:1, 4])
             cache = C{Tuple{Int,Int}}(tuple, domain; options...)
@@ -67,7 +67,7 @@ end
 
 @testset "Cache-side tree offsets" begin
     for (C, options) in ((JITArray, (;)), (ExactLRUArray, (; capacity=2)),
-                         (SampledLRUArray, (; capacity=2))),
+                         (ApproxLRUArray, (; capacity=2))),
         storage in (:radixtree, :subtree)
         plain = C{NTuple{2,Int}}(tuple, (0:100, 0:100); storage, block_shape=(4,8), options...)
         shifted = C{NTuple{2,Int}}(tuple, (-19:100, -11:100); storage, block_shape=(4,8), options...)
@@ -101,7 +101,7 @@ end
 @testset "Centered tree grids" begin
     for center in (0.5, -0.5), storage in (:radixtree, :subtree),
         (C, options) in ((JITArray, (;)), (ExactLRUArray, (; capacity=2)),
-                         (SampledLRUArray, (; capacity=2)))
+                         (ApproxLRUArray, (; capacity=2)))
         cache = C{Tuple{Int,Int}}(tuple, unbound(2); storage, block_shape=(8,4), center, options...)
         lo = center == 0.5 ? (-3,-1) : (-4,-2)
         hi = (lo[1]+7, lo[2]+3)

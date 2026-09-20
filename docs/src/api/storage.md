@@ -16,7 +16,7 @@ Mix axis forms as needed. `unbound(N)` creates `N` unbounded axes.
 ```julia
 JITArray{Float64}((i, j) -> Float64(i) + j, (100, 100))
 ExactLRUArray{Float64}((i, j) -> Float64(i) + j, (-10:10, 20); capacity=32)
-SampledLRUArray{Float64}((i, j) -> Float64(i) + j, unbound(2); capacity=512)
+ApproxLRUArray{Float64}((i, j) -> Float64(i) + j, unbound(2); capacity=512)
 JITArray{Float64}((i, j) -> Float64(i) + j, (:, 1:100);
     storage=:radixtree, block_shape=(4, 8))
 ```

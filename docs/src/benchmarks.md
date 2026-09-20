@@ -84,9 +84,9 @@ identical benchmark sequences. Regenerate the SVG diagrams with `python docs/plo
 | Array | 3.6 ns | 3.8 ns | — |
 | JITArray | 4.1 ns | 22.5 ns | — |
 | ExactLRUArray | 10.8 ns | 12.1 ns | 15.2 ns |
-| SampledLRUArray (`:sieve`) | 4.9 ns | 15.0 ns | 24.8 ns |
-| SampledLRUArray (`:batch_reinsert`) | 4.0 ns | 14.0 ns | 22.7 ns |
-| SampledLRUArray (`:batch_age`) | 5.0 ns | 14.3 ns | 20.2 ns |
+| ApproxLRUArray (`:sieve`) | 4.9 ns | 15.0 ns | 24.8 ns |
+| ApproxLRUArray (`:batch_reinsert`) | 4.0 ns | 14.0 ns | 22.7 ns |
+| ApproxLRUArray (`:batch_age`) | 5.0 ns | 14.3 ns | 20.2 ns |
 
 ### Dictionary (`:dict`)
 
@@ -97,9 +97,9 @@ Standalone Julia `Dict` versus DictMap-backed caches.
 | Dict | 12.0 ns | 87.7 ns | 130.3 ns |
 | JITArray | 18.3 ns | 132.1 ns | — |
 | ExactLRUArray | 29.3 ns | 124.2 ns | 167.7 ns |
-| SampledLRUArray (`:sieve`) | 20.4 ns | 124.9 ns | 172.4 ns |
-| SampledLRUArray (`:batch_reinsert`) | 20.3 ns | 113.7 ns | 173.8 ns |
-| SampledLRUArray (`:batch_age`) | 21.0 ns | 116.4 ns | 163.3 ns |
+| ApproxLRUArray (`:sieve`) | 20.4 ns | 124.9 ns | 172.4 ns |
+| ApproxLRUArray (`:batch_reinsert`) | 20.3 ns | 113.7 ns | 173.8 ns |
+| ApproxLRUArray (`:batch_age`) | 21.0 ns | 116.4 ns | 163.3 ns |
 
 ### RadixMap (`:radixtree`)
 
@@ -108,9 +108,9 @@ Standalone Julia `Dict` versus DictMap-backed caches.
 | RadixMap | 35.6 ns | 20.8 ns | 54.2 ns | 33.5 ns | 66.0 ns | 43.5 ns |
 | JITArray | 43.0 ns | 22.4 ns | 81.4 ns | 54.8 ns | — | — |
 | ExactLRUArray | 67.7 ns | 38.1 ns | 72.7 ns | 57.6 ns | 110.1 ns | 70.3 ns |
-| SampledLRUArray (`:sieve`) | 53.3 ns | 33.2 ns | 76.5 ns | 70.0 ns | 123.4 ns | 93.5 ns |
-| SampledLRUArray (`:batch_reinsert`) | 55.6 ns | 28.8 ns | 68.2 ns | 54.4 ns | 91.4 ns | 75.1 ns |
-| SampledLRUArray (`:batch_age`) | 52.1 ns | 29.8 ns | 65.6 ns | 59.0 ns | 92.5 ns | 81.2 ns |
+| ApproxLRUArray (`:sieve`) | 53.3 ns | 33.2 ns | 76.5 ns | 70.0 ns | 123.4 ns | 93.5 ns |
+| ApproxLRUArray (`:batch_reinsert`) | 55.6 ns | 28.8 ns | 68.2 ns | 54.4 ns | 91.4 ns | 75.1 ns |
+| ApproxLRUArray (`:batch_age`) | 52.1 ns | 29.8 ns | 65.6 ns | 59.0 ns | 92.5 ns | 81.2 ns |
 
 ### SubtreeRadixMap (`:subtree`)
 
@@ -119,9 +119,9 @@ Standalone Julia `Dict` versus DictMap-backed caches.
 | SubtreeRadixMap | 47.9 ns | 7.4 ns | 83.9 ns | 13.8 ns | 83.5 ns | 20.6 ns |
 | JITArray | 57.1 ns | 9.6 ns | 115.3 ns | 37.7 ns | — | — |
 | ExactLRUArray | 82.2 ns | 22.1 ns | 111.7 ns | 49.4 ns | 112.4 ns | 44.9 ns |
-| SampledLRUArray (`:sieve`) | 69.9 ns | 14.0 ns | 114.4 ns | 67.2 ns | 116.8 ns | 51.0 ns |
-| SampledLRUArray (`:batch_reinsert`) | 63.2 ns | 15.0 ns | 96.1 ns | 51.8 ns | 118.0 ns | 56.6 ns |
-| SampledLRUArray (`:batch_age`) | 63.4 ns | 14.8 ns | 94.8 ns | 53.7 ns | 118.8 ns | 54.2 ns |
+| ApproxLRUArray (`:sieve`) | 69.9 ns | 14.0 ns | 114.4 ns | 67.2 ns | 116.8 ns | 51.0 ns |
+| ApproxLRUArray (`:batch_reinsert`) | 63.2 ns | 15.0 ns | 96.1 ns | 51.8 ns | 118.0 ns | 56.6 ns |
+| ApproxLRUArray (`:batch_age`) | 63.4 ns | 14.8 ns | 94.8 ns | 53.7 ns | 118.8 ns | 54.2 ns |
 
 ### Matrix operations without output allocations
 

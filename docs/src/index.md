@@ -14,7 +14,7 @@ allocating every position. Requires Julia 1.12 or later.
 ## Choose cache and storage
 
 Choose these independently: **unbounded** or **bounded** caching, with any of the four storage backends.
-Bounded caches offer sampled eviction (default) or exact LRU. Click a diagram node for its API page.
+Bounded caches offer approximate eviction (default) or exact LRU. Click a diagram node for its API page.
 
 ```@raw html
 <iframe src="assets/overview.html" title="Cache and storage choices"

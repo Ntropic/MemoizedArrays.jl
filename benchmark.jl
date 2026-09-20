@@ -251,10 +251,10 @@ function benchmark(; maps=(:array, :dict, :radixtree, :subtree), caches=(:jit, :
         shape = storage in (:radixtree, :subtree) ? (8, 8) : nothing
         domain = storage === :array ? (4096,) : (typemin(Int):typemax(Int), typemin(Int):typemax(Int))
         options = (; storage=storage === :array ? nothing : storage, block_shape=shape)
-        constructors = (jit=JITArray{Value}, exact=ExactLRUArray{Value}, sieve=SampledLRUArray{Value},
-            batch_reinsert=SampledLRUArray{Value}, batch_age=SampledLRUArray{Value})
-        names = (jit="JITArray", exact="ExactLRUArray", sieve="SampledLRUArray (:sieve)",
-            batch_reinsert="SampledLRUArray (:batch_reinsert)", batch_age="SampledLRUArray (:batch_age)")
+        constructors = (jit=JITArray{Value}, exact=ExactLRUArray{Value}, sieve=ApproxLRUArray{Value},
+            batch_reinsert=ApproxLRUArray{Value}, batch_age=ApproxLRUArray{Value})
+        names = (jit="JITArray", exact="ExactLRUArray", sieve="ApproxLRUArray (:sieve)",
+            batch_reinsert="ApproxLRUArray (:batch_reinsert)", batch_age="ApproxLRUArray (:batch_age)")
         selected = Tuple(unique(caches))
         makers = map(selected) do policy
             constructor = constructors[policy]
@@ -314,7 +314,7 @@ function benchmark(; maps=(:array, :dict, :radixtree, :subtree), caches=(:jit, :
             centralmakers = map(bounded) do i
                 policy = selected[i]
                 policy in (:batch_reinsert, :batch_age) ?
-                    () -> SampledLRUArray{Value}(value, domain; options..., capacity=CAPACITY, policy, batch_size=32) :
+                    () -> ApproxLRUArray{Value}(value, domain; options..., capacity=CAPACITY, policy, batch_size=32) :
                     makers[i]
             end
             comparemaps((rawlabels..., boundedlabels...), (rawmakers..., centralmakers...), centralwarm, centralkeys,

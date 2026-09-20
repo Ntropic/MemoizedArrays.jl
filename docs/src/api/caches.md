@@ -53,13 +53,13 @@ LRUArray
 | `:batch_age` | Cleans an old batch; entries reused within a recent cleanup window survive, and older entries are evicted together. |
 
 ```@docs
-SampledLRUArray
+ApproxLRUArray
 ExactLRUArray
 ```
 
 ### Approximate LRU
 
-`SampledLRUArray` supports `:sieve`, `:batch_reinsert`, and `:batch_age`. These policies track reuse without
+`ApproxLRUArray` supports `:sieve`, `:batch_reinsert`, and `:batch_age`. These policies track reuse without
 reordering entries on each read. None uses random sampling.
 
 SIEVE scans insertion order when it needs a victim. It clears visited flags while scanning,

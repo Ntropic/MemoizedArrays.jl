@@ -28,7 +28,7 @@ macro astuple(N, names...)
     return Expr(:block, (:($(esc(name)) = as_tuple($(esc(name)), Val($(esc(N))))) for name in names)...)
 end
 
-export AbstractJITArray, JITArray, LRUArray, ExactLRUArray, SampledLRUArray, generate!
+export AbstractJITArray, JITArray, LRUArray, ExactLRUArray, ApproxLRUArray, generate!
 export SparseJITArray, SparseLRUArray
 export getready, unbound, isunbound
 
@@ -39,7 +39,7 @@ abstract type SparseMap{T,N} end
 
 include("caches/JITArray.jl")
 include("caches/ExactLRUArray.jl")
-include("caches/SampledLRUArray.jl")
+include("caches/ApproxLRUArray.jl")
 include("maps/ArrayMap.jl")
 include("maps/DictMap.jl")
 include("maps/TreeMap.jl")

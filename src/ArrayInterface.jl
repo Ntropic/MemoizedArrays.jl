@@ -28,7 +28,7 @@ Base.iterate(axis::AxisExtent) = isempty(axis) ? nothing : (first(axis), first(a
 Base.iterate(axis::AxisExtent, state::Int) = state == last(axis) ? nothing : (state + 1, state + 1)
 
 """`LRUArray{V}(generator, dims...; capacity, policy=:sieve, kwargs...)`: policies `:sieve` (default), `:batch_reinsert`, `:batch_age`, `:exact`."""
-const LRUArray{V,N} = Union{ExactLRUArray{V,N},SampledLRUArray{V,N}}
+const LRUArray{V,N} = Union{ExactLRUArray{V,N},ApproxLRUArray{V,N}}
 const ArrayBacked{V,N} = AbstractJITArray{V,N,M} where {M<:ArrayMap}
 const SparseArray{V,N} = AbstractJITArray{V,N,M} where {M<:SparseMap}
 """
@@ -44,14 +44,14 @@ const SparseJITArray{V,N} = JITArray{V,N,M} where {M<:SparseMap}
 
 Cache signed coordinates with eviction. Omitted ranges share the Int linear-index capacity.
 """
-const SparseLRUArray{V,N} = Union{ExactLRUArray{V,N,M},SampledLRUArray{V,N,M}} where {M<:SparseMap}
+const SparseLRUArray{V,N} = Union{ExactLRUArray{V,N,M},ApproxLRUArray{V,N,M}} where {M<:SparseMap}
 
 function LRUArray{V}(generator, domain::VT{N,T}; capacity::Int,
     policy::Symbol=:sieve, kwargs...) where {V,N,T}
     if policy === :exact
         return ExactLRUArray{V}(generator, domain; capacity, kwargs...)
     end
-    return SampledLRUArray{V}(generator, domain; capacity, policy, kwargs...)
+    return ApproxLRUArray{V}(generator, domain; capacity, policy, kwargs...)
 end
 
 SparseJITArray{V}(generator, axes::VT{N,R}; storage=:dict, kwargs...) where {V,N,R} = JITArray{V}(generator, axes; storage, kwargs...)

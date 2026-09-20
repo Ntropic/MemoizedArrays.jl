@@ -27,13 +27,13 @@ mutable struct BatchState{E}
 end
 
 """
-    SampledLRUArray{V}(generator, domain; capacity, policy=:sieve, batch_size=nothing, keep_epochs=nothing, kwargs...)
+    ApproxLRUArray{V}(generator, domain; capacity, policy=:sieve, batch_size=nothing, keep_epochs=nothing, kwargs...)
 
 Approximate LRU with `:sieve` (default), `:batch_reinsert`, or `:batch_age`. Batch policies process
 `batch_size` entries at a time (default 64, limited by capacity). Age retention uses
 `keep_epochs` processed blocks; its default is at least four blocks and one pool pass.
 """
-mutable struct SampledLRUArray{V,N,M,G,Policy,E,A,L,H,D,Offset,R} <: AbstractJITArray{V,N,M}
+mutable struct ApproxLRUArray{V,N,M,G,Policy,E,A,L,H,D,Offset,R} <: AbstractJITArray{V,N,M}
     const capacity::Int
     count::Int
     const active::A
@@ -46,7 +46,7 @@ mutable struct SampledLRUArray{V,N,M,G,Policy,E,A,L,H,D,Offset,R} <: AbstractJIT
     const generator::G
 end
 
-function SampledLRUArray{V}(generator::G, domain::VT{N,T}; capacity::Int, policy::Symbol=:sieve,
+function ApproxLRUArray{V}(generator::G, domain::VT{N,T}; capacity::Int, policy::Symbol=:sieve,
     storage=nothing, block_shape=nothing, center=nothing, batch_size::Union{Nothing,Int}=nothing,
     keep_epochs::Union{Nothing,Int}=nothing) where {V,G,N,T}
     if capacity < 1
@@ -77,15 +77,15 @@ function SampledLRUArray{V}(generator::G, domain::VT{N,T}; capacity::Int, policy
     end
     active = preallocate(E, capacity)
     offset = routing_offset(map)
-    return SampledLRUArray{V,length(domain),typeof(map),G,policy,E,typeof(active),L,H,typeof(domain),offset,typeof(recency)}(
+    return ApproxLRUArray{V,length(domain),typeof(map),G,policy,E,typeof(active),L,H,typeof(domain),offset,typeof(recency)}(
         capacity, 0, active, nothing, nothing, nothing, recency, domain, map, generator)
 end
 
-@inline cache_offset(::SampledLRUArray{V,N,M,G,P,E,A,L,H,D,O}) where {V,N,M,G,P,E,A,L,H,D,O} = Val(O)
+@inline cache_offset(::ApproxLRUArray{V,N,M,G,P,E,A,L,H,D,O}) where {V,N,M,G,P,E,A,L,H,D,O} = Val(O)
 
-SampledLRUArray{V}(generator, axis::Union{Int,AbstractUnitRange{Int}}, axes::Union{Int,AbstractUnitRange{Int}}...; kwargs...) where V = SampledLRUArray{V}(generator, (axis, axes...); kwargs...)
-SampledLRUArray{V}(domain::VT{N,T}, capacity::Int, generator::Function; kwargs...) where {V,N,T} = SampledLRUArray{V}(generator, domain; capacity, kwargs...)
-@inline entrytype(::SampledLRUArray{V,N,M,G,P,E}) where {V,N,M,G,P,E} = E
+ApproxLRUArray{V}(generator, axis::Union{Int,AbstractUnitRange{Int}}, axes::Union{Int,AbstractUnitRange{Int}}...; kwargs...) where V = ApproxLRUArray{V}(generator, (axis, axes...); kwargs...)
+ApproxLRUArray{V}(domain::VT{N,T}, capacity::Int, generator::Function; kwargs...) where {V,N,T} = ApproxLRUArray{V}(generator, domain; capacity, kwargs...)
+@inline entrytype(::ApproxLRUArray{V,N,M,G,P,E}) where {V,N,M,G,P,E} = E
 
 @inline function batchappend!(cache, stored)
     state = cache.recency
@@ -134,7 +134,7 @@ function batchclean!(cache)
     return nothing
 end
 
-@inline function cacheget(cache::SampledLRUArray{V,N,M,G,P,E}, key, indices=nothing) where {V,N,M,G,P,E<:BatchEntry}
+@inline function cacheget(cache::ApproxLRUArray{V,N,M,G,P,E}, key, indices=nothing) where {V,N,M,G,P,E<:BatchEntry}
     routing = cache_routing(cache, key)
     slot, hint = prepare(cache.map, key, routing)
     if slot !== nothing
@@ -170,7 +170,7 @@ end
 
 # SIEVE: Zhang et al., SIEVE is Simpler than LRU (NSDI 2024).
 # https://www.usenix.org/conference/nsdi24/presentation/zhang-yazhuo
-function victim!(cache::SampledLRUArray{V,N,M,G,:sieve}) where {V,N,M,G}
+function victim!(cache::ApproxLRUArray{V,N,M,G,:sieve}) where {V,N,M,G}
     stored = cache.hand === nothing ? cache.oldest : cache.hand
     while stored.visited
         stored.visited = false
@@ -180,7 +180,7 @@ function victim!(cache::SampledLRUArray{V,N,M,G,:sieve}) where {V,N,M,G}
     return stored
 end
 
-@inline function cacheget(cache::SampledLRUArray{V,N,M,G,:sieve,E}, key, indices=nothing) where {V,N,M,G,E<:SieveEntry}
+@inline function cacheget(cache::ApproxLRUArray{V,N,M,G,:sieve,E}, key, indices=nothing) where {V,N,M,G,E<:SieveEntry}
     routing = cache_routing(cache, key)
     slot, hint = prepare(cache.map, key, routing)
     if slot !== nothing
