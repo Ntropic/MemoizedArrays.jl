@@ -4,7 +4,7 @@
 CurrentModule = JITArrays
 ```
 
-Choose how long generated values remain resident. Both choices work with every [storage backend](storage.md).
+Choose how long generated values remain resident. All policies work with every [storage backend](storage.md).
 Vector/tuple arguments use [`VT`](@ref).
 
 Put the generator first, followed by dimensions or signed ranges. Tuple/vector domains also work.
@@ -38,7 +38,7 @@ getready
 ## [Bounded caching](@id bounded)
 
 Limit the number of stored values. Values are generated before admission and eviction.
-Full caches reuse evicted entry objects. Eviction does not mutate or invalidate values already returned.
+Bounded caches reuse evicted entry objects. Eviction does not mutate or invalidate values already returned.
 `isready` neither generates values nor changes recency.
 
 ```@docs
@@ -48,8 +48,9 @@ LRUArray
 | Policy | Behavior |
 |---|---|
 | `:exact` | Evicts the least recently accessed value; updates its access order on each read. |
-| `:clock` (default) | Scans a circular resident vector, giving visited entries a second chance. |
-| `:sieve` | Scans insertion order; reads mark entries as visited without reordering. |
+| `:sieve` (default) | Scans insertion order; reads mark entries as visited without reordering. |
+| `:batch_reinsert` | Cleans an old batch; reused entries get another turn in the queue, and unvisited entries are evicted together. |
+| `:batch_age` | Cleans an old batch; entries reused within a recent cleanup window survive, and older entries are evicted together. |
 
 ```@docs
 SampledLRUArray
@@ -58,11 +59,38 @@ ExactLRUArray
 
 ### Approximate LRU
 
-`SampledLRUArray(...; policy=:clock)` and `SampledLRUArray(...; policy=:sieve)` are specializations
-of the same cache type. Reads set a visited bit; neither policy uses access counters or random samples.
-CLOCK stores residents in a circular vector; SIEVE keeps insertion order in a linked list.
+`SampledLRUArray` supports `:sieve`, `:batch_reinsert`, and `:batch_age`. These policies track reuse without
+reordering entries on each read. None uses random sampling.
+
+SIEVE scans insertion order when it needs a victim. It clears visited flags while scanning,
+then evicts the first unvisited entry. A newly inserted entry starts unvisited.
+
+The batch policies keep an insertion queue and a pool of reusable entries. When the pool is
+empty, cleanup processes up to `batch_size` queued entries together. `:batch_reinsert` clears each
+survivor's visited flag and appends it to the queue; `:batch_age` appends recent survivors without
+changing their timestamps. New entries have no reuse mark until first read.
+
+```julia
+cache = LRUArray{Float64}(i -> sin(i), (100_000,);
+    capacity=10_000, policy=:batch_reinsert, batch_size=64)
+
+cache = LRUArray{Float64}(i -> sin(i), (100_000,);
+    capacity=10_000, policy=:batch_age, batch_size=64, keep_epochs=160)
+```
+
+`batch_size` defaults to 64 and is capped at `capacity`. It groups residents by queue order,
+independently of their coordinates or tree leaves. Cleanup repeats until it releases at least one
+entry, so `batch_size` does not bound the total work of an individual request. Later insertions
+consume the freed entries without another cleanup. Occupancy can drop below capacity between
+cleanups, and the request that triggers cleanup pays for the whole batch.
+
+For `:batch_age`, each processed batch advances an epoch. Reads record the current epoch;
+an entry survives while its age is less than `keep_epochs`. The default is
+`max(4, cld(capacity, min(batch_size, capacity)))`. These epochs count cleanup batches,
+not elapsed time or reads. `keep_epochs` applies only to `:batch_age`.
+
+All cache policies currently require synchronous access; concurrent access to a cache is unsupported.
 
 ### References
 
-- **CLOCK:** F. J. Corbató, [*A Paging Experiment with the Multics System*](https://multicians.org/paging-experiment.pdf), in *In Honor of Philip M. Morse*, MIT Press, 1969, pp. 217–228. The circular scan gives referenced entries a second chance.
-- **SIEVE:** Yazhuo Zhang, Juncheng Yang, Yao Yue, Ymir Vigfusson, and K. V. Rashmi, [*SIEVE is Simpler than LRU: an Efficient Turn-Key Eviction Algorithm for Web Caches*](https://www.usenix.org/conference/nsdi24/presentation/zhang-yazhuo), NSDI 2024. Hits mark entries visited; the eviction hand scans insertion order and clears visited bits.
+- **SIEVE:** Yazhuo Zhang, Juncheng Yang, Yao Yue, Ymir Vigfusson, and K. V. Rashmi, [*SIEVE is Simpler than LRU: an Efficient Turn-Key Eviction Algorithm for Web Caches*](https://www.usenix.org/conference/nsdi24/presentation/zhang-yazhuo), NSDI 2024. Cached reads mark entries visited; the eviction hand scans insertion order and clears visited flags.

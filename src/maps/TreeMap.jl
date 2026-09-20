@@ -33,28 +33,71 @@ end
 @inline preparedentry(leaf::TreeLeaf, state::Tuple) = slot_entry(store_lookup(leaf.values, state[3], nothing))
 
 """Radix map: traverse high coordinate bits first."""
-struct RadixMap{T,N,BlockShape,D,E} <: SparseMap{T,N}
+struct RadixMap{T,N,BlockShape,D,E,PositiveCenter} <: SparseMap{T,N}
     roots::ArrayMap{TreeNode{T,N},1}
     empty::E
     domain::D
 end
 
-"""One radix tree with depth-indexed shortcuts; storage option `:subtreetree`."""
-struct SubtreeRadixMap{T,N,BlockShape,D,E} <: SparseMap{T,N}
+"""One radix tree with depth-indexed shortcuts; storage option `:subtree`."""
+struct SubtreeRadixMap{T,N,BlockShape,D,E,Levels,PositiveCenter} <: SparseMap{T,N}
     roots::ArrayMap{TreeNode{T,N},1}
     empty::E
     domain::D
+    zero::NTuple{N,UInt}
+    zero_path::NTuple{Levels,Int}
 end
 
 const TreeMap{T,N,B} = Union{RadixMap{T,N,B},SubtreeRadixMap{T,N,B}}
 
-# Unsigned zigzag includes typemin(Int) without signed overflow.
-@inline signed2unsigned(i::Int) = (reinterpret(UInt, i) << 1) ⊻ reinterpret(UInt, i >> (8sizeof(Int) - 1))
-@inline tree_key(key::NTuple{N,Int}) where N = ntuple(i -> signed2unsigned(key[i]), Val(N))
-@inline store_hash(::SubtreeRadixMap, key) = tree_key(key)
+# Slots are filled with a sentinel at construction and are never unset. Keep Julia's
+# normal GC-tracked loads, but let subtree reads omit undefined-reference guards.
+@inline function assume_initialized(condition::Bool)
+    Base.llvmcall(("""
+        declare void @llvm.assume(i1)
+        define void @entry(i8 %condition) alwaysinline {
+            %ok = icmp ne i8 %condition, 0
+            call void @llvm.assume(i1 %ok)
+            ret void
+        }
+        """, "entry"), Cvoid, Tuple{Bool}, condition)
+    return nothing
+end
+
+@inline slot_entry(slot::MemoryRef, ::TreeMap) = slot_entry(slot)
+@inline function slot_entry(slot::MemoryRef, ::SubtreeRadixMap)
+    assume_initialized(Core.memoryref_isassigned(slot, :not_atomic, false))
+    return slot_entry(slot)
+end
+
 # Cache routing converts the checked coordinates once; traversal only sees unsigned offsets.
-@inline store_hash(store::RadixMap{T,N}, key) where {T,N} = ntuple(i -> reinterpret(UInt, key[i]) - reinterpret(UInt, first(store.domain[i])), Val(N))
+@inline store_hash(store::TreeMap{T,N}, key) where {T,N} = ntuple(i -> reinterpret(UInt, key[i]) + tree_offset(store)[i], Val(N))
 @inline block_shape(::TreeMap{T,N,B}) where {T,N,B} = B
+@inline tree_offset(::RadixMap{T,N,B,D,E,C}) where {T,N,B,D,E,C} = tree_offset(B, C)
+@inline tree_offset(::SubtreeRadixMap{T,N,B,D,E,L,C}) where {T,N,B,D,E,L,C} = tree_offset(B, C)
+
+# Alternating middle children keep each ancestor as close to the requested center
+# as the already aligned children allow. Arithmetic wraps across the full UInt domain.
+Base.@constprop :aggressive function tree_offset(block::NTuple{N,Int}, positive::Bool) where N
+    return ntuple(Val(N)) do i
+        width = block[i]
+        bits = trailing_zeros(width)
+        offset = UInt(0)
+        digit = width ÷ 2 - positive
+        for shift in 0:bits:8sizeof(UInt)-1
+            offset |= UInt(digit) << shift
+            digit = width - 1 - digit
+        end
+        offset
+    end
+end
+
+function positive_center(center)
+    if !(center isa Real && (center == 0.5 || center == -0.5))
+        throw(ArgumentError("tree center must be 0.5 or -0.5"))
+    end
+    return center == 0.5
+end
 @inline function node_level(node::TreeNode{T,N}) where {T,N}
     if node isa TreeLeaf{T,N}
         return 0
@@ -122,29 +165,45 @@ end
 @inline tree_level(store::TreeMap, key) = tree_level(block_shape(store), key)
 
 @inline rootindex(::RadixMap, encoded) = 1
-@inline rootindex(store::SubtreeRadixMap, encoded) = tree_level(store, encoded) + 1
+@inline rootindex(store::SubtreeRadixMap{T,N}, encoded) where {T,N} = tree_level(store, ntuple(i -> encoded[i] ⊻ store.zero[i], Val(N))) + 1
 
-# The last subtree slot owns the tree; earlier slots only alias its zero-prefix path.
+# The last subtree slot owns the tree; earlier slots alias the path containing coordinate zero.
 @inline rootlink(store::TreeMap) = @inbounds store_lookup(store.roots, length(store.roots.reference.mem), nothing)
-refresh!(::RadixMap) = nothing
-function refresh!(store::SubtreeRadixMap{T,N}) where {T,N}
-    node = slot_entry(rootlink(store))
-    for depth in (length(store.roots.reference.mem)-2):-1:0
+refresh!(::RadixMap, depth) = nothing
+# Skipped depths retain their nearest existing ancestor, so requests only descend.
+function refresh!(store::SubtreeRadixMap{T,N}, depth::Int) where {T,N}
+    ancestor = slot_entry(store_lookup(store.roots, depth + 2, nothing))
+    node = ancestor
+    for depth in depth:-1:0
         while node isa TreeBranch{T,N} && node.level > depth
-            node = slot_entry(store_lookup(node.children, 1, nothing))
+            child = slot_entry(store_lookup(node.children, store.zero_path[node.level + 1], nothing))
+            if child === store.roots.empty || node_level(child) < depth ||
+                    !tree_matches(store, store.zero, node_prefix(child), node_level(child))
+                break
+            end
+            node = child
         end
-        slot_publish!(store_lookup(store.roots, depth + 1, nothing), node === store.roots.empty || any(!iszero, tree_prefix(store, node_prefix(node), depth)) ? store.roots.empty : node)
+        level = max(depth, node_level(node))
+        alias = node === store.roots.empty || tree_prefix(store, node_prefix(node), level) != tree_prefix(store, store.zero, level) ? store.roots.empty : node
+        slot = store_lookup(store.roots, depth + 1, nothing)
+        if slot_entry(slot) === alias
+            if node !== ancestor
+                break
+            end
+        else
+            slot_publish!(slot, alias)
+        end
     end
     return nothing
 end
 
 # Flatten only a checked local block in column-major order.
-@inline function tree_address(store::TreeMap{T,N}, key, level::Int) where {T,N}
+@inline tree_address(store::TreeMap, key, level::Int) = tree_address(block_shape(store), key, level)
+@inline function tree_address(block::NTuple{N,Int}, key, level::Int) where N
     address, shift = UInt(0), 0
-    block = block_shape(store)
     for i in 1:N
         width = block[i]
-        bitoffset = unsigned(tree_bits(store, i, level - 1))
+        bitoffset = unsigned(level * trailing_zeros(width))
         if width == minimum(block)
             # The narrowest axes define the maximum level, so their shifts always fit.
             bitoffset &= UInt(8sizeof(UInt) - 1)
@@ -156,19 +215,25 @@ end
     return Int(address) + 1
 end
 
-function RadixMap(::Type{T}, ranges::Tuple{Vararg{Any,N}}, block::VT{N,Int}, empty) where {T,N}
+function RadixMap(::Type{T}, ranges::Tuple{Vararg{Any,N}}, block::VT{N,Int}, empty; center=0.5) where {T,N}
     @astuple N block
     block_length(block, 2)
     roots = ArrayMap(TreeNode{T,N}, (1,), TreeLeaf{T,N}(empty))
-    return RadixMap{T,N,block,typeof(ranges),typeof(empty)}(roots, empty, ranges)
+    return RadixMap{T,N,block,typeof(ranges),typeof(empty),positive_center(center)}(roots, empty, ranges)
 end
 
-function SubtreeRadixMap(::Type{T}, ranges::Tuple{Vararg{Any,N}}, block::VT{N,Int}, empty) where {T,N}
+function SubtreeRadixMap(::Type{T}, ranges::Tuple{Vararg{Any,N}}, block::VT{N,Int}, empty; center=0.5) where {T,N}
     @astuple N block
     block_length(block, 2)
+    if any(axis -> !(first(axis) <= 0 <= last(axis)), ranges)
+        throw(ArgumentError("SubtreeRadixMap requires every domain axis to contain zero"))
+    end
     levels = tree_level(block, ntuple(_ -> typemax(UInt), Val(N))) + 1
+    positive = positive_center(center)
+    zero = tree_offset(block, positive)
+    zero_path = ntuple(i -> tree_address(block, zero, i - 1), levels)
     roots = ArrayMap(TreeNode{T,N}, (levels,), TreeLeaf{T,N}(empty))
-    return SubtreeRadixMap{T,N,block,typeof(ranges),typeof(empty)}(roots, empty, ranges)
+    return SubtreeRadixMap{T,N,block,typeof(ranges),typeof(empty),levels,positive}(roots, empty, ranges, zero, zero_path)
 end
 
 function tree_leaf(store::TreeMap{T,N}, key) where {T,N}
@@ -186,37 +251,77 @@ end
 @inline store_lookup(store::TreeMap, key, encoded) = treefind(store, encoded, Val(false))
 @inline prepare(store::TreeMap, key, encoded) = treefind(store, encoded, Val(true))
 
+@inline store_lookup(store::SubtreeRadixMap{T,N}, key, route::Tuple{NTuple{N,UInt},Int}) where {T,N} =
+    treefind(store, route[1], route[2], Val(false))
+@inline prepare(store::SubtreeRadixMap{T,N}, key, route::Tuple{NTuple{N,UInt},Int}) where {T,N} =
+    treefind(store, route[1], route[2], Val(true))
+@inline function reserve!(store::SubtreeRadixMap{T,N}, key, route::Tuple{NTuple{N,UInt},Int}, slot, state) where {T,N}
+    link, parent, address = state
+    if slot !== nothing
+        if slot.used > 0
+            return LeafSlot(slot, address)
+        end
+        # Keep retraversal for an invalidated hint out of the common insertion path.
+        return @noinline store_reserve!(store, key, route)
+    elseif parent === nothing
+        return treereserve!(store, route[1], rootlink(store), nothing, 1)
+    elseif parent.used >= 2
+        return treereserve!(store, route[1], link, parent, address)
+    end
+    return @noinline store_reserve!(store, key, route)
+end
+@inline store_reserve!(store::SubtreeRadixMap{T,N}, key, route::Tuple{NTuple{N,UInt},Int}) where {T,N} =
+    store_reserve!(store, key, route[1], route[2])
+
 @inline function treefind(store::TreeMap{T,N}, encoded, ::Val{prepared}) where {T,N,prepared}
-    index = rootindex(store, encoded)
-    link = @inbounds store_lookup(store.roots, index, nothing)
-    maxlevel = tree_level(store, ntuple(_ -> typemax(UInt), Val(N)))
-    return treefind(store, encoded, link, maxlevel, Val(prepared))
+    return treefind(store, encoded, rootindex(store, encoded), Val(prepared))
 end
 
-# Shortcuts enter the same top-down traversal; validate prefixes across compressed gaps.
-@inline function treefind(store::TreeMap{T,N}, encoded, link, maxlevel::Int, ::Val{prepared}) where {T,N,prepared}
-    # Adjacent levels already establish the child's prefix through the selected digit.
+@inline function treefind(store::TreeMap{T,N}, encoded, index::Int, ::Val{prepared}) where {T,N,prepared}
+    if store isa SubtreeRadixMap && index == 1
+        # An existing central leaf is direct; otherwise this slot supplies its ancestor.
+        link = @inbounds store_lookup(store.roots, 1, nothing)
+        leaf = slot_entry(link, store)
+        if leaf isa TreeLeaf{T,N}
+            if leaf === store.roots.empty
+                return prepared ? (nothing, (link, nothing, 1)) : nothing
+            end
+            address = tree_address(store, encoded, 0)
+            return prepared ? (leaf, (link, nothing, address)) : LeafSlot(leaf, address)
+        end
+    else
+        link = @inbounds store_lookup(store.roots, index, nothing)
+    end
+    level = store isa SubtreeRadixMap ? max(index - 1, node_level(slot_entry(link, store))) :
+        tree_level(store, ntuple(_ -> typemax(UInt), Val(N)))
+    return treefind(store, encoded, link, level, Val(prepared))
+end
+
+# Validate a compressed transition before entering its node. Adjacent levels and
+# a depth-zero shortcut already establish the destination's prefix.
+@inline function treefind(store::TreeMap{T,N}, encoded, link, expectedlevel::Int, ::Val{prepared}) where {T,N,prepared}
     empty = store.roots.empty::TreeLeaf{T,N}
-    level = maxlevel + 1
     parent, address = nothing, 1
     while true
-        node = slot_entry(link)
+        node = slot_entry(link, store)
         if node === empty
             return prepared ? (nothing, (link, parent, address)) : nothing
         end
         if node isa TreeLeaf{T,N}
-            if level != 1 && !tree_matches(store, encoded, node.prefix, 0)
+            if expectedlevel != 0 && !tree_matches(store, encoded, node.prefix, 0)
                 return prepared ? (nothing, (link, parent, address)) : nothing
             end
+            # Enter the established leaf and select its value slot.
             address = tree_address(store, encoded, 0)
             return prepared ? (node, (link, parent, address)) : LeafSlot(node, address)
         end
         branch = node::TreeBranch{T,N}
-        if branch.level + 1 != level && !tree_matches(store, encoded, branch.prefix, branch.level)
+        if branch.level != expectedlevel && !tree_matches(store, encoded, branch.prefix, branch.level)
             return prepared ? (nothing, (link, parent, address)) : nothing
         end
+        # Enter the established branch and select its child slot.
         address = tree_address(store, encoded, branch.level)
-        level = branch.level
+        expectedlevel = branch.level - 1
         parent = branch
         link = @inbounds store_lookup(branch.children, address, nothing)
     end
@@ -245,40 +350,55 @@ function tree_add_child!(branch::TreeBranch, address::Int, child)
     return nothing
 end
 
+@inline has_shortcut(::RadixMap, branch) = false
+@inline function has_shortcut(store::SubtreeRadixMap, branch)
+    # An off-zero owning root can still be aliased above its occupied prefix.
+    depth = max(branch.level + 1, rootindex(store, branch.prefix))
+    return slot_entry(store_lookup(store.roots, depth, nothing)) === branch
+end
+@inline zero_child(::RadixMap, branch) = 1
+@inline zero_child(store::SubtreeRadixMap, branch) = @inbounds store.zero_path[branch.level + 1]
+
 function tree_publish!(store, link, old, node, parent, address::Int)
     slot_publish!(link, node)
     if old === store.roots.empty && parent !== nothing
         parent.used += 1
         parent.occupied ⊻= address
     end
-    (parent === nothing || (address == 1 && all(iszero, parent.prefix))) && refresh!(store)
+    if parent === nothing
+        refresh!(store, length(store.roots.reference.mem)-2)
+    elseif address == zero_child(store, parent) && has_shortcut(store, parent)
+        refresh!(store, parent.level-1)
+    end
     return nothing
 end
 
 # Walk node references; construct a writable link only at a missing position.
-@inline function store_reserve!(store::RadixMap{T,N}, key, encoded) where {T,N}
+@inline store_reserve!(store::RadixMap{T,N}, key, encoded) where {T,N} =
+    store_reserve!(store, key, encoded, slot_entry(store_lookup(store.roots, 1, nothing)),
+        tree_level(store, ntuple(_ -> typemax(UInt), Val(N))))
+
+@inline function store_reserve!(store::TreeMap{T,N}, key, encoded, node, expectedlevel::Int) where {T,N}
     empty = store.roots.empty
-    node = slot_entry(store_lookup(store.roots, 1, nothing))
-    level = tree_level(store, ntuple(_ -> typemax(UInt), Val(N))) + 1
     parent, address = nothing, 1
     # Carry the next adjacent-level index; compressed gaps recompute it below.
-    nextaddress = tree_address(store, encoded, level - 1)
+    nextaddress = tree_address(store, encoded, expectedlevel)
     while node isa TreeBranch{T,N}
         branch = node
-        if branch.level + 1 != level
+        if branch.level != expectedlevel
             if !tree_matches(store, encoded, branch.prefix, branch.level)
                 break
             end
             nextaddress = tree_address(store, encoded, branch.level)
         end
         parent = branch
-        level = branch.level
+        expectedlevel = branch.level - 1
         address = nextaddress
-        nextaddress = tree_address(store, encoded, level - 1)
+        nextaddress = tree_address(store, encoded, expectedlevel)
         node = slot_entry(store_lookup(branch.children, address, nothing))
     end
     if node isa TreeLeaf{T,N} && node !== empty
-        if level == 1 || tree_matches(store, encoded, node.prefix, 0)
+        if expectedlevel == 0 || tree_matches(store, encoded, node.prefix, 0)
             return LeafSlot(node, tree_address(store, encoded, 0))
         end
     end
@@ -286,20 +406,34 @@ end
     return treereserve!(store, encoded, link, parent, address)
 end
 
-function store_reserve!(store::TreeMap{T,N}, key, encoded) where {T,N}
-    link = rootlink(store)
-    return treereserve!(store, encoded, link, nothing, 1)
+@inline store_reserve!(store::SubtreeRadixMap, key, encoded) =
+    store_reserve!(store, key, encoded, rootindex(store, encoded))
+
+@inline function store_reserve!(store::SubtreeRadixMap{T,N}, key, encoded, index::Int) where {T,N}
+    if index == 1
+        node = slot_entry(store_lookup(store.roots, 1, nothing))
+        if node isa TreeLeaf{T,N}
+            if node !== store.roots.empty
+                return LeafSlot(node, tree_address(store, encoded, 0))
+            end
+            return treereserve!(store, encoded, rootlink(store), nothing, 1)
+        end
+    else
+        node = slot_entry(store_lookup(store.roots, index, nothing))
+    end
+    return store_reserve!(store, key, encoded, node, max(index-1, node_level(node)))
 end
 
 function treereserve!(store::TreeMap{T,N}, encoded, link, parent, address) where {T,N}
     empty = store.roots.empty::TreeLeaf{T,N}
+    expectedlevel = parent === nothing ? tree_level(store, ntuple(_ -> typemax(UInt), Val(N))) : parent.level - 1
     while true
         node = slot_entry(link)
         if node === empty
             leaf = tree_leaf(store, encoded)
             tree_publish!(store, link, node, leaf, parent, address)
             return LeafSlot(leaf, tree_address(store, encoded, 0))
-        elseif !tree_matches(store, encoded, node_prefix(node), node_level(node))
+        elseif node_level(node) != expectedlevel && !tree_matches(store, encoded, node_prefix(node), node_level(node))
             prefix = node_prefix(node)
             difference = ntuple(i -> prefix[i] ⊻ encoded[i], Val(N))
             level = tree_level(store, difference)
@@ -314,6 +448,7 @@ function treereserve!(store::TreeMap{T,N}, encoded, link, parent, address) where
         else
             parent = node::TreeBranch{T,N}
             address = tree_address(store, encoded, parent.level)
+            expectedlevel = parent.level - 1
             link = @inbounds store_lookup(parent.children, address, nothing)
         end
     end
@@ -323,9 +458,10 @@ end
 function tree_remove!(store::TreeMap{T,N}, encoded, leaf) where {T,N}
     link = rootlink(store)
     node = slot_entry(link)
+    depth = length(store.roots.reference.mem)-2
     if node === leaf
         slot_publish!(link, store.roots.empty)
-        refresh!(store)
+        refresh!(store, depth)
         return nothing
     end
     while true
@@ -333,17 +469,24 @@ function tree_remove!(store::TreeMap{T,N}, encoded, leaf) where {T,N}
         address = tree_address(store, encoded, branch.level)
         child = slot_entry(store_lookup(branch.children, address, nothing))
         if child === leaf
+            refresh = has_shortcut(store, branch)
             delete_key!(branch.children, address)
             branch.used -= 1
             branch.occupied ⊻= address
             if branch.used == 1
-                slot_publish!(link, slot_entry(store_lookup(branch.children, branch.occupied, nothing)))
+                remaining = slot_entry(store_lookup(branch.children, branch.occupied, nothing))
+                slot_publish!(link, remaining)
+                if refresh
+                    refresh!(store, depth)
+                end
+            elseif refresh && address == zero_child(store, branch)
+                refresh!(store, branch.level-1)
             end
-            all(iszero, branch.prefix) && refresh!(store)
             return nothing
         end
         link = @inbounds store_lookup(branch.children, address, nothing)
         node = child
+        depth = branch.level-1
     end
 end
 
@@ -356,10 +499,18 @@ function store_delete!(store::TreeMap, key, slot::LeafSlot)
     return nothing
 end
 
-function delete_key!(map::TreeMap{T,N}, key) where {T,N}
-    encoded = store_hash(map, key)
+@inline delete_key!(map::TreeMap, key) = delete_key!(map, key, store_hash(map, key))
+
+# Use depth shortcuts for removal too; only an emptied leaf needs root-based pruning.
+@inline function delete_key!(map::SubtreeRadixMap, key, routing)
+    slot = store_lookup(map, key, routing)
+    return @inline store_delete!(map, key, slot)
+end
+
+@inline function delete_key!(map::TreeMap{T,N}, key, encoded) where {T,N}
     link = rootlink(map)
     node = slot_entry(link)
+    depth = length(map.roots.reference.mem)-2
     parent, address = nothing, 1
     while node isa TreeBranch{T,N}
         parent = node
@@ -371,22 +522,30 @@ function delete_key!(map::TreeMap{T,N}, key) where {T,N}
         end
         link = @inbounds store_lookup(parent.children, address, nothing)
         node = child
+        depth = parent.level-1
     end
     leaf = node::TreeLeaf{T,N}
     delete_key!(leaf.values, tree_address(map, encoded, 0))
     leaf.used -= 1
     if leaf.used == 0
+        refresh = parent === nothing || has_shortcut(map, parent)
         if parent === nothing
             slot_publish!(link, map.roots.empty)
+            refresh!(map, depth)
         else
             delete_key!(parent.children, address)
             parent.used -= 1
             parent.occupied ⊻= address
             if parent.used == 1
-                slot_publish!(link, slot_entry(store_lookup(parent.children, parent.occupied, nothing)))
+                remaining = slot_entry(store_lookup(parent.children, parent.occupied, nothing))
+                slot_publish!(link, remaining)
+                if refresh
+                    refresh!(map, depth)
+                end
+            elseif refresh && address == zero_child(map, parent)
+                refresh!(map, parent.level-1)
             end
         end
-        (parent === nothing || all(iszero, parent.prefix)) && refresh!(map)
     end
     return nothing
 end

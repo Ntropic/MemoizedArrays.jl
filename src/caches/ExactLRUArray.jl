@@ -14,44 +14,39 @@ mutable struct ExactLRUEntry{V,Key} <: AbstractEntry{V}
 end
 
 """
-    ExactLRUArray{V}(generator, dims...; capacity, kwargs...)
+    ExactLRUArray{V}(generator, domain::VT{N,T}; capacity, kwargs...)
 
-Cache values with exact LRU eviction. Accept sizes or coordinate ranges.
-Sparse storage: `:dict` (default), `:radixtree`, `:subtreetree`; trees require `block_shape`.
+Cache values with exact LRU eviction. Domain axes are lengths, integer ranges, or `:`.
+Omitted storage selects `:array` for finite domains and `:dict` otherwise; trees require `block_shape`.
 """
-mutable struct ExactLRUArray{V,N,M,G,Key} <: AbstractJITArray{V,N,M}
+mutable struct ExactLRUArray{V,N,M,G,Key,D,Offset} <: AbstractJITArray{V,N,M}
     const capacity::Int
     count::Int
     const entries::Vector{ExactLRUEntry{V,Key}}
     const root::ExactLRUEntry{V,Key}
+    const domain::D
     const map::M
     const generator::G
 end
 
-function ExactLRUArray{V}(generator, domain::VT{N,T}; capacity::Int,
-    storage=nothing, block_shape=nothing) where {V,N,T<:Union{Int,AbstractUnitRange{Int}}}
-    storage = domain_storage(domain, storage)
-    @astuple length(domain) domain
-    return construct(ExactLRUArray{V}, domain, generator, capacity, storage, block_shape)
+function ExactLRUArray{V}(generator::G, domain::VT{N,T}; capacity::Int,
+    storage=nothing, block_shape=nothing, center=nothing) where {V,G,N,T}
+    if capacity < 1
+        throw(ArgumentError("capacity must be positive"))
+    end
+    map, domain = make_cache_map(ExactLRUEntry, V, domain, storage, block_shape, center)
+    root = map.empty
+    E = typeof(root)
+    Key = fieldtype(E, :key)
+    offset = routing_offset(map)
+    return ExactLRUArray{V,length(domain),typeof(map),G,Key,typeof(domain),offset}(
+        capacity, 0, preallocate(E, capacity), root, domain, map, generator)
 end
 
-ExactLRUArray{V}(generator, dims::Int...; kwargs...) where V = ExactLRUArray{V}(generator, dims; kwargs...)
+@inline cache_offset(::ExactLRUArray{V,N,M,G,K,D,O}) where {V,N,M,G,K,D,O} = Val(O)
 
-ExactLRUArray{V}(generator, axis::AbstractUnitRange{Int}, axes::AbstractUnitRange{Int}...; kwargs...) where V = ExactLRUArray{V}(generator, (axis, axes...); kwargs...)
-
+ExactLRUArray{V}(generator, axis::Union{Int,AbstractUnitRange{Int}}, axes::Union{Int,AbstractUnitRange{Int}}...; kwargs...) where V = ExactLRUArray{V}(generator, (axis, axes...); kwargs...)
 ExactLRUArray{V}(domain::VT{N,T}, capacity::Int, generator::Function; kwargs...) where {V,N,T} = ExactLRUArray{V}(generator, domain; capacity, kwargs...)
-
-function construct(::Type{ExactLRUArray{V}}, input::Tuple, generator::G, capacity::Int,
-    storage, block) where {V,G}
-    capacity < 1 && throw(ArgumentError("capacity must be positive"))
-    domain = axis_domain(input, storage)
-    Key = entry_keytype(domain, storage)
-    E = ExactLRUEntry{V,Key}
-    root = E()
-    map = make_map(E, domain, storage, block, root)
-    return ExactLRUArray{V,length(domain),typeof(map),G,Key}(
-        capacity, 0, preallocate(E, capacity), root, map, generator)
-end
 
 # Circular list: root.next is oldest, root.previous is newest.
 @inline function policy_touch(cache, entry::ExactLRUEntry)
@@ -72,7 +67,7 @@ end
 @inline entrytype(::ExactLRUArray{V,N,M,G,Key}) where {V,N,M,G,Key} = ExactLRUEntry{V,Key}
 
 @inline function cacheget(cache::ExactLRUArray{V,N,M,G,Key}, key, indices=nothing) where {V,N,M,G,Key}
-    routing = store_hash(cache.map, key)
+    routing = cache_routing(cache, key)
     slot, hint = prepare(cache.map, key, routing)
     if slot !== nothing
         stored = preparedentry(slot, hint)
@@ -84,7 +79,7 @@ end
     value = generated isa V ? generated : convert(V, generated)
     if cache.count == cache.capacity
         stored = cache.root.next
-        delete_key!(cache.map, stored.key)
+        delete_entry!(cache, stored.key)
         stored.key = key
         stored.value = value
         policy_touch(cache, stored)

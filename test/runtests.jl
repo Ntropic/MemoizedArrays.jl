@@ -10,7 +10,7 @@ end
 replacementallocation(cache, key) = @allocated cache[key]
 
 @testset "Map/cache integration" begin
-    for storage in (:array, :dict, :radixtree, :subtreetree), T in (JITArray, ExactLRUArray, SampledLRUArray)
+    for storage in (:array, :dict, :radixtree, :subtree), T in (JITArray, ExactLRUArray, SampledLRUArray)
         calls = Ref(0)
         generator = i -> (calls[] += 1; i)
         domain = storage === :array ? (6,) : (-1:6,)
@@ -18,7 +18,7 @@ replacementallocation(cache, key) = @allocated cache[key]
         capacity = T === JITArray ? (;) : (; capacity=2)
         cache = T{Int}(generator, domain; options..., capacity...)
         if T !== JITArray
-            @test !hasfield(typeof(cache), :domain)
+            @test hasfield(typeof(cache), :domain)
         end
         @test size(cache) == (storage === :array ? (6,) : (8,))
         @test !isready(cache, 1)
@@ -42,7 +42,7 @@ end
         i + j
     end
     @test cache[2, 3] == 5
-    @test JITArray{Int}(() -> 7)[] == 7
+    @test JITArray{Int}(() -> 7, ())[] == 7
     @test isempty(JITArray{Int}(identity, 0))
     @test_throws BoundsError JITArray{Int}(identity, 0)[1]
     @test_throws ArgumentError JITArray{Int}(identity, -1)
@@ -53,6 +53,28 @@ end
     @test JA.as_tuple([2, 3], Val(2)) === (2, 3)
     @test_throws DimensionMismatch JA.as_tuple([2], Val(2))
     @test isempty(detect_ambiguities(JITArrays))
+end
+
+@testset "Explicit array storage" begin
+    for T in (JITArray, ExactLRUArray, SampledLRUArray, LRUArray)
+        options = T === JITArray ? (;) : (; capacity=2)
+        cache = T{Int}(+, (2, 3); storage=:array, options...)
+        @test cache.map isa JA.ArrayMap
+        @test size(cache) == (2, 3)
+        @test cache[2, 3] == cache[6] == 5
+        scalar = T{Int}(() -> 7, (); storage=:array, options...)
+        @test scalar.map isa JA.ArrayMap
+        @test scalar[] == 7
+        if T === JITArray
+            @test cache.map.empty isa JA.ArrayEntry{Int}
+        end
+        for axis in ((Colon(),), (typemin(Int):typemax(Int),))
+            @test_throws ArgumentError T{Int}(identity, axis; storage=:array, options...)
+        end
+        @test_throws ArgumentError T{Int}(identity, 4; storage=:array, block_shape=(8,), options...)
+    end
+    @test_throws ArgumentError JITArray{Int}(identity, unbound(1); storage=:array)
+    @test_throws ArgumentError LRUArray{Int}(identity, unbound(1); capacity=2, storage=:array)
 end
 
 @testset "Array interface" begin
@@ -161,10 +183,10 @@ end
         @test dependent[1] == 12
     end
     # Reuse the cache entry across map families without changing returned value objects.
-    for C in (ExactLRUArray, SampledLRUArray), storage in (:array, :dict, :radixtree, :subtreetree)
-        domain = storage === :array ? (1024,) : (1:1024,)
+    for C in (ExactLRUArray, SampledLRUArray), storage in (:array, :dict, :radixtree, :subtree)
+        domain = storage === :array ? (1024,) : (0:1024,)
         options = (; storage=storage === :array ? nothing : storage,
-            block_shape=storage in (:radixtree, :subtreetree) ? (8,) : nothing)
+            block_shape=storage in (:radixtree, :subtree) ? (8,) : nothing)
         cache = C{Vector{Int}}(i -> [i], domain; capacity=1, options...)
         retained = cache[1]
         stored = JA.entry(cache, JA.cache_key(cache, 1))
@@ -179,17 +201,17 @@ end
         @test replacementallocation(cache, 3) == 0
     end
     # Nested generation can resize the dictionary before the outer value is stored.
-    nested = JITArray{Int}(i -> i == 0 ? sum(nested[k] for k in 1:60) : i, 0:60)
+    nested = JITArray{Int}(i -> i == 0 ? sum(nested[k] for k in 1:60) : i, 0:60; storage=:dict)
     @test nested[0] == sum(1:60)
     @test all(k -> isready(nested, k), 0:60)
     # Nested insertion can occupy a saved dictionary position without resizing.
     keys = filter(i -> hash((i,)) & UInt(63) == 0, 1:1000)[1:2]
-    colliding = JITArray{Int}(i -> i == keys[1] ? colliding[keys[2]] + 1 : i, 1:1000)
+    colliding = JITArray{Int}(i -> i == keys[1] ? colliding[keys[2]] + 1 : i, 1:1000; storage=:dict)
     @test colliding[keys[1]] == keys[2] + 1
     @test colliding[keys[2]] == keys[2]
     @test colliding.map.count == 2
     # Nested eviction can detach the branch saved for an outer tree miss.
-    for storage in (:radixtree, :subtreetree)
+    for storage in (:radixtree, :subtree)
         pruning = ExactLRUArray{Int}(i -> i == 40 ? pruning[512] + i : i, 0:1024;
             capacity=2, storage, block_shape=(8,))
         pruning[32], pruning[36]
@@ -232,22 +254,23 @@ include("Maps_test.jl")
 @testset "Approximate LRU specializations" begin
     @test_throws ArgumentError SampledLRUArray{Int}(identity,4;capacity=1,policy=:sampled)
     @test_throws ArgumentError LRUArray{Int}(identity,4;capacity=1,policy=:sample5)
-    for policy in (:clock,:sieve)
+    for policy in (:sieve,:batch_reinsert,:batch_age)
         cache = SampledLRUArray{Int}(identity, [64]; capacity=4, policy)
         @test cache isa SampledLRUArray && typeof(cache).parameters[5] === policy
-        @test !hasfield(typeof(cache), :domain) && !hasfield(typeof(cache), :counter)
+        @test hasfield(typeof(cache), :domain) && !hasfield(typeof(cache), :counter)
         valid = true
         for (request, k) in enumerate([1:32; 1:8; 33:64])
-            valid &= cache[k] == k && cache.count == count(i -> isready(cache, i), 1:64) == min(request, 4)
+            valid &= cache[k] == k && cache.count == count(i -> isready(cache, i), 1:64)
+            valid &= 1 <= cache.count <= min(request, 4)
         end
         @test valid
-        @test SampledLRUArray{Int}(() -> 7; capacity=1, policy)[] == 7
+        @test SampledLRUArray{Int}(() -> 7, (); capacity=1, policy)[] == 7
         @test SampledLRUArray{Int}((4,), 1, identity; policy)[2] == 2
         @test_throws ArgumentError SampledLRUArray{Int}(identity,4;capacity=0,policy)
         sparse = SparseLRUArray{Int}(identity; ndims=1, capacity=2, policy)
         @test sparse[-1] == -1
         @test copy(view(cache,1:3)) == [1,2,3]
-        for storage in (:array,:dict,:radixtree,:subtreetree)
+        for storage in (:array,:dict,:radixtree,:subtree)
             options = storage === :array ? (;) : storage === :dict ? (;storage) : (;storage,block_shape=(8,))
             domain = storage === :array ? (1024,) : (0:1024,)
             nested = SampledLRUArray{Int}(i -> i == 40 ? nested[512] + i : i, domain; capacity=2, policy, options...)
@@ -272,23 +295,126 @@ include("Maps_test.jl")
     @test isready(sieve,1) && !isready(sieve,2)
     sieve[5]
     @test !isready(sieve,3) && isready(sieve,5)
-    clock = SampledLRUArray{Int}(identity,8;capacity=3)
-    generate!(clock,[1,2,3]); clock[4]
-    @test !isready(clock,1) && isready(clock,4)
+    default = SampledLRUArray{Int}(identity,8;capacity=3)
+    @test typeof(default).parameters[5] === :sieve
+    generate!(default,[1,2,3]); default[1]; default[4]
+    @test isready(default,1) && !isready(default,2)
+end
+
+function checkbatch(cache, keys)
+    state = cache.recency
+    @test cache.count + state.nfree == cache.capacity
+    queued = [state.queue[mod1(state.head + i, cache.capacity)] for i in 0:cache.count-1]
+    free = cache.active[1:state.nfree]
+    @test length(IdDict(entry => nothing for entry in [queued; free])) == cache.capacity
+    @test all(entry -> JA.entry(cache, entry.key) === entry, queued)
+    @test count(key -> isready(cache, key), keys) == cache.count
+    if cache.map isa JA.TreeMap
+        treecounts(cache.map)
+    elseif cache.map isa JA.DictMap
+        @test cache.map.count == cache.count
+    end
+end
+
+@testset "Batch recency and pool reuse" begin
+    for policy in (:batch_reinsert, :batch_age), storage in (:array, :dict, :radixtree, :subtree)
+        options = storage in (:radixtree, :subtree) ? (; block_shape=(8,)) : (;)
+        cache = LRUArray{Int}(i -> 3i + 1, (0:1024,);
+            capacity=7, policy, storage, batch_size=3, options...)
+        # An odd queue length and partial blocks exercise wrap and reuse across distant leaves.
+        for requests in (0:6, (0,1,0), 512:525, 0:13)
+            @test all(cache[key] == 3key + 1 for key in requests)
+            checkbatch(cache, [0:13; 512:525])
+        end
+    end
+    for policy in (:batch_reinsert, :batch_age)
+        cache = SampledLRUArray{Int}(identity, 8; capacity=4, policy, batch_size=2)
+        generate!(cache, 1:4)
+        cache[1]
+        @test cache[5] == 5
+        @test isready(cache, 1) && !isready(cache, 2)
+        @test cache.count == 4
+        @test cache[6] == 6
+        @test !isready(cache, 3) && !isready(cache, 4) && cache.count == 3
+        @test cache[7] == 7 && cache.count == 4
+        checkbatch(cache, 1:8)
+        # An entirely reused pool must eventually age/reset enough entries to make progress.
+        generate!(cache, filter(key -> isready(cache, key), 1:8))
+        @test cache[8] == 8
+        checkbatch(cache, 1:8)
+        larger = SampledLRUArray{Int}(identity, 2; capacity=7, policy)
+        @test larger[1] == 1 && larger[2] == 2 && larger.count == 2
+    end
+    for keep_epochs in (2, 4)
+        cache = SampledLRUArray{Int}(identity, 8;
+            capacity=4, policy=:batch_age, batch_size=2, keep_epochs)
+        generate!(cache, 1:4)
+        cache[1]
+        generate!(cache, 5:8)
+        @test isready(cache, 1) == (keep_epochs == 4)
+    end
+    for storage in (:radixtree, :subtree), policy in (:batch_reinsert, :batch_age)
+        cache = SampledLRUArray{Int}(identity, unbound(1); storage, policy,
+            capacity=2, batch_size=2, block_shape=(8,))
+        generate!(cache, [0, 1])
+        @test cache[2] == 2 && cache.count == 1
+        @test !isready(cache, 0) && !isready(cache, 1) && isready(cache, 2)
+        treecounts(cache.map)
+        @test cache[512] == 512
+        @test cache[1024] == 1024 && cache.count == 1
+        @test !isready(cache, 2) && !isready(cache, 512)
+        treecounts(cache.map)
+    end
+end
+
+@testset "Batch options and generator errors" begin
+    @test_throws ArgumentError SampledLRUArray{Int}(identity, 4; capacity=2, batch_size=1)
+    for policy in (:sieve, :batch_reinsert)
+        @test_throws ArgumentError SampledLRUArray{Int}(identity, 4; capacity=2, policy, keep_epochs=1)
+    end
+    for policy in (:batch_reinsert, :batch_age), invalid in (0, -1)
+        @test_throws ArgumentError SampledLRUArray{Int}(identity, 4; capacity=2, policy, batch_size=invalid)
+    end
+    for invalid in (0, -1)
+        @test_throws ArgumentError SampledLRUArray{Int}(identity, 4; capacity=2, policy=:batch_age, keep_epochs=invalid)
+    end
+    for (capacity, batch_size, expected) in ((1, nothing, 4), (65, nothing, 4), (65, 3, 22))
+        age = SampledLRUArray{Int}(identity, 2; capacity, policy=:batch_age, batch_size)
+        @test age.recency.blocksize == min(capacity, batch_size === nothing ? 64 : batch_size)
+        @test age.recency.keep_epochs == expected
+    end
+    for policy in (:batch_reinsert, :batch_age), storage in (:array, :dict, :radixtree, :subtree)
+        options = storage in (:radixtree, :subtree) ? (; block_shape=(8,)) : (;)
+        calls = Ref(0)
+        cache = SampledLRUArray{Int}(i -> (calls[] += 1; i == 2 ? error("generator failed") : i),
+            (0:8,); capacity=2, policy, storage, options...)
+        generate!(cache, [0, 1])
+        @test_throws ErrorException cache[2]
+        @test calls[] == 3 && cache.count == 2
+        @test isready(cache, 0) && isready(cache, 1) && !isready(cache, 2)
+        @test cache[3] == 3
+        checkbatch(cache, 0:8)
+        converted = SampledLRUArray{Int}(_ -> 0.5, (0:8,); capacity=2, policy, storage, options...)
+        @test_throws InexactError converted[1]
+        @test converted.count == 0 && !isready(converted, 1)
+    end
 end
 
 @testset "Preallocated entries" begin
     for make in (()->ExactLRUArray{Int}(identity,8;capacity=3),
-                 ()->SampledLRUArray{Int}(identity,8;capacity=3,policy=:clock),
-                 ()->SampledLRUArray{Int}(identity,8;capacity=3,policy=:sieve))
+                 ()->SampledLRUArray{Int}(identity,8;capacity=3,policy=:sieve),
+                 ()->SampledLRUArray{Int}(identity,8;capacity=3,policy=:batch_reinsert),
+                 ()->SampledLRUArray{Int}(identity,8;capacity=3,policy=:batch_age))
         replacementallocation(make(),1)
         cache=make()
-        entries=cache isa ExactLRUArray ? cache.entries : cache.active
+        entries=copy(cache isa ExactLRUArray ? cache.entries : cache.active)
         @test cache.count == 0 && !isready(cache,1)
         for k in 1:3
             @test replacementallocation(cache,k) == 0
-            @test JITArrays.entry(cache,k) === entries[k]
+            @test any(entry -> JITArrays.entry(cache,k) === entry, entries)
         end
-        @test replacementallocation(cache,4) == 0 && cache.count == 3
+        @test replacementallocation(cache,4) == 0 && 1 <= cache.count <= 3
     end
 end
+
+include("ConstructorDomains_test.jl")

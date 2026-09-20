@@ -1,218 +1,131 @@
 # Benchmarks
 
+Current implementation, Julia 1.13.0, AMD Ryzen AI 7 350, 2026-09-20.
+Tables report median time per request for the workloads below.
+
 ## Run
 
-ArrayMap with all cache variants, followed by matrix operations:
+Run all maps and cache policies, followed by the matrix-operation benchmarks:
 
 ```sh
-julia --startup-file=no --compiled-modules=existing --project=. benchmark.jl --maps=array
+julia --startup-file=no --compiled-modules=existing --project=. benchmark.jl
 ```
 
-Select cache variants with `--caches=jit,exact,clock,sieve`. Other maps remain available
-through `--maps`.
+Select maps with `--maps=array,dict,radixtree,subtree` and cache policies with
+`--caches=jit,exact,sieve,batch_reinsert,batch_age`. For example, `--maps=array --caches=jit,exact`
+runs only those cache/map combinations, followed by matrix operations.
 
-## ArrayMap
+## Cache workload
 
-Median time per request, Julia 1.12.7, AMD Ryzen AI 7 350, 2026-09-17.
+Fifteen rotated rounds, eight containers per sample, and 512 distinct resident keys.
+The generator returns an existing 4×4 matrix. Each timed request consumes its first
+element in a scalar checksum; no output array is written.
+
+- **Read:** retrieve an existing value from a populated cache, with 32,768 requests per container.
+- **Initial generation / insertion:** populate an initially empty container with 512 values.
+  This includes entry allocation and any map growth or tree-node creation.
+- **Generation / insertion (central leaf):** prefill one central-leaf value and 448 scattered
+  values, then generate the remaining 63 central-leaf values. The leaf already exists and
+  capacity is sufficient: no branch/leaf creation or eviction is included. Verify outside
+  timing that all target values were missing and the existing central leaf remains attached.
+  Average eight fresh batches of eight containers per round: 4,032 timed insertions, comparable
+  to the 4,096 in initial population. Report the median of these averages over the 15 rotated rounds.
+- **Generate + evict / replace:** prefill 512 values, then request 512 new keys.
+  Bounded caches choose eviction victims; raw maps replace specified existing keys.
+- **Generate + evict / replace (central leaf):** fill the cache with 32 central-leaf
+  entries first, then 480 entries outside that leaf. Request the other 32 central-leaf
+  coordinates, moving x by 4. Every request generates; raw maps delete the
+  corresponding old central entry. Verify outside timing that the original central
+  entries were evicted, the new ones are present, the outside entries remain, and the
+  same central leaf is retained. Average 16 fresh batches of eight containers per round
+  (4,096 replacements). Victim-selection scans remain included in timing. `:batch_reinsert` and
+  `:batch_age` use `batch_size=32` in this column: the first request evicts the 32 old values,
+  and the remaining requests refill those freed entries. This keeps every victim central.
+
+Construction, compilation, prefill, validation and round-boundary GC are outside timing.
+GC occurring during an operation remains included. Bounded caches preallocate entries
+during setup; JITArray retains all generated values and has no eviction measurement.
+Raw Array, Dict and tree rows store the supplied matrix directly; cache rows call the
+generator on a missing value.
+
+Batch policies use their default `batch_size=64` except in the central-leaf eviction
+column described above. `:batch_age` uses its default retention window. Batch timings include
+complete cleanup bursts and are amortized per request; individual cleanup requests cost more.
+
+ArrayMap uses 4,096 slots and integer keys. Dictionary and tree cases use two-dimensional
+coordinate keys and full signed-Int axes. Dictionary resident coordinates are nearby and
+nonnegative. Both trees use `block_shape=(8, 8)` and `center=0.5`.
+Initial tree generation and ordinary replacement workloads use 16 values in each of 32 neighboring leaves.
+Ordinary replacement
+moves keys by 128 along x into a different region. Central-leaf replacement uses nearby
+coordinates outside the central leaf to fill the remaining capacity.
+
+### Tree read sampling
+
+Both read columns use the same populated tree: all 64 keys in the central leaf, plus
+448 distinct keys sampled uniformly across a 4,096 × 4,096 coordinate region outside that leaf.
+Sampling uses a fixed seed. There are no generation or eviction requests in either read column.
+
+- **Read (spread out):** requests cycle evenly through the 448 scattered keys, then are shuffled.
+- **Read (central leaf):** each of the 64 central-leaf keys receives 512 reads, shuffled in advance.
+  Every request selects the level-zero shortcut in SubtreeRadixMap.
+
+![Two sampling patterns: evenly spread requests on the left, requests only in the central leaf on the right](assets/tree-sampling.svg)
+
+Schematic distributions: evenly spread requests (left) and requests confined to one central leaf
+(right). Squares represent leaves; green highlights the central leaf. Equal-size dots represent requests. Both tree maps receive
+identical benchmark sequences. Regenerate the SVG diagrams with `python docs/plot_tree_sampling.py`
+(requires Matplotlib).
+
+### ArrayMap
 
 | Implementation | Read | Initial generation / insertion | Generate + evict |
 |---|---:|---:|---:|
-| Array | 3.6 ns | 3.7 ns | — |
-| JITArray | 3.9 ns | 18.4 ns | — |
-| ExactLRUArray | 10.1 ns | 11.7 ns | 13.9 ns |
-| SampledLRUArray (`:clock`) | 4.4 ns | 8.5 ns | 14.8 ns |
-| SampledLRUArray (`:sieve`) | 4.3 ns | 12.4 ns | 19.2 ns |
+| Array | 3.6 ns | 3.8 ns | — |
+| JITArray | 4.1 ns | 22.5 ns | — |
+| ExactLRUArray | 10.8 ns | 12.1 ns | 15.2 ns |
+| SampledLRUArray (`:sieve`) | 4.9 ns | 15.0 ns | 24.8 ns |
+| SampledLRUArray (`:batch_reinsert`) | 4.0 ns | 14.0 ns | 22.7 ns |
+| SampledLRUArray (`:batch_age`) | 5.0 ns | 14.3 ns | 20.2 ns |
 
-4096 slots, capacity 512, fifteen rotated rounds with eight containers per sample.
-Reads use 32,768 requests/container; generation and eviction use 512. The generator
-returns an existing 4×4 matrix. Each request consumes its first element in a scalar
-checksum; no output array is written. Setup, prefill and round-boundary GC are excluded.
-Bounded caches preallocate entries during setup. JITArray has no eviction.
+### Dictionary (`:dict`)
 
-### ArrayMap backing storage: Array → Memory
-
-ArrayMap now stores slots in `Memory`, keeps shape and strides directly, and returns
-`MemoryRef` slots. The former Array-backed implementation and the new implementation
-were measured in the same process with rotated execution order. Shape, indexing,
-generator and cache policies were unchanged. Values are **Array-backed → Memory-backed**.
-
-| Cache | Read | Initial generation | Generate + evict |
-|---|---:|---:|---:|
-| JITArray | 3.6 ns → 3.9 ns | 20.2 ns → 18.4 ns | — |
-| ExactLRUArray | 10.7 ns → 10.1 ns | 12.6 ns → 11.7 ns | 14.8 ns → 13.9 ns |
-| SampledLRUArray (`:clock`) | 4.8 ns → 4.4 ns | 9.0 ns → 8.5 ns | 17.8 ns → 14.8 ns |
-| SampledLRUArray (`:sieve`) | 4.9 ns → 4.3 ns | 13.4 ns → 12.4 ns | 19.6 ns → 19.2 ns |
-
-Most operations improved modestly in this run; JITArray reads were 0.3 ns slower.
-This compares complete backing implementations, including their slot references and
-metadata layout, rather than isolating the buffer type alone.
-
-## Dict
-
-Standalone Julia `Dict` versus our `DictMap` inside each cache. Run only this comparison:
-
-```sh
-julia --startup-file=no --compiled-modules=existing --project=. -e 'include("benchmark.jl"); benchmark(maps=(:dict,))'
-```
+Standalone Julia `Dict` versus DictMap-backed caches.
 
 | Implementation | Read | Initial generation / insertion | Generate + evict / replace |
 |---|---:|---:|---:|
-| Dict | 23.6 ns | 102.3 ns | 258.8 ns |
-| JITArray | 20.5 ns | 122.7 ns | — |
-| ExactLRUArray | 31.4 ns | 109.0 ns | 209.3 ns |
-| SampledLRUArray (:clock) | 22.9 ns | 100.6 ns | 164.7 ns |
-| SampledLRUArray (:sieve) | 22.8 ns | 116.1 ns | 181.6 ns |
-
-Median time per request, using the same generator, request counts and rotated rounds as above.
-All implementations use `(Int, Int)` keys, with 512 nearby resident coordinates. DictMap-backed
-caches use full signed axis ranges; bounded caches have capacity 512. `Dict` inserts supplied
-values directly and replaces by deleting a specified key and inserting another. Caches call
-the generator on misses and choose their own eviction victim.
-
-The ArrayMap optimizations also apply here: preallocated LRU entries, victim reuse, concrete
-ExactLRU links, direct generated-value returns and conversion only when needed. DictMap retains
-the incoming hash and insertion position across generation, rechecking the position if nested
-generation changes the table. Probe indices use masked signed arithmetic without redundant
-checked conversions. DictMap still allocates a stable map record for each inserted key and
-occasionally rebuilds its table; preallocating cache entries does not remove those costs.
-
-## Radix trees
-
-```sh
-julia --startup-file=no --compiled-modules=existing --project=. -e 'include("benchmark.jl"); benchmark(maps=(:radixtree,:subtreetree))'
-```
-
-Median time per request, Julia 1.12.7, AMD Ryzen AI 7 350, 2026-09-17.
-Both maps use the same nearby two-dimensional coordinates, request counts, generator,
-and rotated rounds as the Dict comparison. Each table includes raw map operations
-and all four cache variants. These results do not cover scattered or large coordinates.
+| Dict | 12.0 ns | 87.7 ns | 130.3 ns |
+| JITArray | 18.3 ns | 132.1 ns | — |
+| ExactLRUArray | 29.3 ns | 124.2 ns | 167.7 ns |
+| SampledLRUArray (`:sieve`) | 20.4 ns | 124.9 ns | 172.4 ns |
+| SampledLRUArray (`:batch_reinsert`) | 20.3 ns | 113.7 ns | 173.8 ns |
+| SampledLRUArray (`:batch_age`) | 21.0 ns | 116.4 ns | 163.3 ns |
 
 ### RadixMap (`:radixtree`)
 
-| Implementation | Read | Initial generation / insertion | Generate + evict / replace | Delete |
-|---|---:|---:|---:|---:|
-| RadixMap | 24.5 ns | 152.7 ns | 132.4 ns | 40.4 ns |
-| JITArray | 35.1 ns | 154.1 ns | — | — |
-| ExactLRUArray | 45.9 ns | 142.3 ns | 157.4 ns | — |
-| SampledLRUArray (:clock) | 38.6 ns | 117.2 ns | 152.7 ns | — |
-| SampledLRUArray (:sieve) | 40.8 ns | 157.4 ns | 152.6 ns | — |
+| Implementation | Read (spread out) | Read (central leaf) | Initial generation / insertion | Generation / insertion (central leaf) | Generate + evict / replace | Generate + evict / replace (central leaf) |
+|---|---:|---:|---:|---:|---:|---:|
+| RadixMap | 35.6 ns | 20.8 ns | 54.2 ns | 33.5 ns | 66.0 ns | 43.5 ns |
+| JITArray | 43.0 ns | 22.4 ns | 81.4 ns | 54.8 ns | — | — |
+| ExactLRUArray | 67.7 ns | 38.1 ns | 72.7 ns | 57.6 ns | 110.1 ns | 70.3 ns |
+| SampledLRUArray (`:sieve`) | 53.3 ns | 33.2 ns | 76.5 ns | 70.0 ns | 123.4 ns | 93.5 ns |
+| SampledLRUArray (`:batch_reinsert`) | 55.6 ns | 28.8 ns | 68.2 ns | 54.4 ns | 91.4 ns | 75.1 ns |
+| SampledLRUArray (`:batch_age`) | 52.1 ns | 29.8 ns | 65.6 ns | 59.0 ns | 92.5 ns | 81.2 ns |
 
-### SubtreeRadixMap (`:subtreetree`)
+### SubtreeRadixMap (`:subtree`)
 
-| Implementation | Read | Initial generation / insertion | Generate + evict / replace | Delete |
-|---|---:|---:|---:|---:|
-| SubtreeRadixMap | 31.1 ns | 101.9 ns | 154.8 ns | 60.7 ns |
-| JITArray | 39.3 ns | 115.6 ns | — | — |
-| ExactLRUArray | 53.4 ns | 112.4 ns | 189.5 ns | — |
-| SampledLRUArray (:clock) | 40.3 ns | 99.2 ns | 171.9 ns | — |
-| SampledLRUArray (:sieve) | 41.9 ns | 112.2 ns | 183.2 ns | — |
+| Implementation | Read (spread out) | Read (central leaf) | Initial generation / insertion | Generation / insertion (central leaf) | Generate + evict / replace | Generate + evict / replace (central leaf) |
+|---|---:|---:|---:|---:|---:|---:|
+| SubtreeRadixMap | 47.9 ns | 7.4 ns | 83.9 ns | 13.8 ns | 83.5 ns | 20.6 ns |
+| JITArray | 57.1 ns | 9.6 ns | 115.3 ns | 37.7 ns | — | — |
+| ExactLRUArray | 82.2 ns | 22.1 ns | 111.7 ns | 49.4 ns | 112.4 ns | 44.9 ns |
+| SampledLRUArray (`:sieve`) | 69.9 ns | 14.0 ns | 114.4 ns | 67.2 ns | 116.8 ns | 51.0 ns |
+| SampledLRUArray (`:batch_reinsert`) | 63.2 ns | 15.0 ns | 96.1 ns | 51.8 ns | 118.0 ns | 56.6 ns |
+| SampledLRUArray (`:batch_age`) | 63.4 ns | 14.8 ns | 94.8 ns | 53.7 ns | 118.8 ns | 54.2 ns |
 
-`SubtreeRadixMap` selects a depth shortcut into one shared radix tree. Structural
-changes on the zero-prefix path refresh those pointers. Initial insertion was faster
-in this run; reads, deletion and replacement were slower than `RadixMap`.
+### Matrix operations without output allocations
 
-### Central-leaf and scattered routing experiment
-
-```sh
-julia --startup-file=no --compiled-modules=existing --project=. experiments/treepositions.jl
-```
-
-Both maps contain the same 512 values: all 64 coordinates in `(-4:3, -4:3)` and
-448 scattered coordinates across the signed `Int` range. Zigzag encoding places the
-central coordinates in one leaf. The subtree shortcut is checked to point directly
-to that leaf; the distant residents keep the full tree populated above it.
-Each workload uses 32,768 randomized ready reads and 31 rotated rounds. All measured
-loops allocate zero bytes, consume a scalar checksum, and write no output array.
-These measure raw maps, not cache policies. Julia 1.12.7, 2026-09-17.
-
-| Implementation / workload | Full read | Encoding precomputed | Encoding + depth precomputed |
-|---|---:|---:|---:|
-| RadixMap / central leaf | 31.5 ns | 28.3 ns | 32.6 ns |
-| SubtreeRadixMap / central leaf | 11.4 ns | 9.9 ns | 7.7 ns |
-| RadixMap / scattered | 52.3 ns | 47.2 ns | 51.1 ns |
-| SubtreeRadixMap / scattered | 72.0 ns | 61.7 ns | 54.8 ns |
-
-Precomputed depth supplies the shortcut index; loading its pointer and traversing the
-tree remain timed. Precomputation changes the request representation and generated
-loop, so differences are not exact additive instruction costs.
-
-| Arithmetic / workload | Encoding | Depth selection | Leaf position | Combined |
-|---|---:|---:|---:|---:|
-| RadixMap / central leaf | 0.8 ns | 0.0 ns | 2.4 ns | 2.4 ns |
-| SubtreeRadixMap / central leaf | 0.8 ns | 1.2 ns | 2.4 ns | 5.5 ns |
-| RadixMap / scattered | 0.8 ns | 0.0 ns | 2.4 ns | 2.4 ns |
-| SubtreeRadixMap / scattered | 0.8 ns | 1.2 ns | 2.4 ns | 5.6 ns |
-
-Arithmetic-only loops consume integer checksums and measure throughput, not isolated
-instruction latency. RadixMap's constant root selection is optimized away. Combined
-arithmetic includes encoding, root selection and the bottom-leaf position, not addresses
-at intervening branch levels. These timings must not be added to predict read latency.
-
-| Direct central-leaf access | Read |
-|---|---:|
-| Compute position from encoded coordinates | 3.5 ns |
-| Position precomputed | 3.5 ns |
-
-Compiled leaf-position code uses two masks and one address calculation. Depth selection
-uses OR, leading-zero count, and constant multiply/shift arithmetic; it has no integer
-division instruction. Both operate on machine words regardless of how many bits are set.
-
-The central shortcut makes full reads about 2.8× faster than starting at the main root.
-Leaf-position arithmetic is not the principal overhead: removing it does not improve
-the direct-leaf baseline. Precomputing encoding and depth reduces central subtree reads
-from 11.4 ns to 7.7 ns, but generic node/prefix handling and pointer loads remain above
-the 3.5 ns direct baseline. Scattered reads benefit substantially from precomputation,
-although the changed loop layout prevents assigning the entire difference to arithmetic.
-
-### TreeHint removal: paired cache comparison
-
-The previous `TreeHint` struct and current tuple representation were compared in the
-same process, using an isolated source copy differing only in that representation.
-Each pair uses the nearby-coordinate workload above, fifteen rotated rounds and eight
-containers per sample. These are cache operations: raw map reads bypass the prepared
-lookup path affected by this change. Values below are medians, Julia 1.12.7, 2026-09-17.
-
-#### RadixMap
-
-| Implementation | Read | Initial generation | Generate + evict |
-|---|---:|---:|---:|
-| JITArray / TreeHint | 35.6 ns | 97.2 ns | — |
-| JITArray / tuple | 35.2 ns | 98.6 ns | — |
-| ExactLRUArray / TreeHint | 46.1 ns | 100.1 ns | 150.6 ns |
-| ExactLRUArray / tuple | 46.6 ns | 100.8 ns | 148.0 ns |
-| SampledLRUArray (:clock) / TreeHint | 43.3 ns | 93.6 ns | 146.1 ns |
-| SampledLRUArray (:clock) / tuple | 43.9 ns | 92.8 ns | 165.7 ns |
-| SampledLRUArray (:sieve) / TreeHint | 42.6 ns | 100.2 ns | 169.0 ns |
-| SampledLRUArray (:sieve) / tuple | 41.7 ns | 96.8 ns | 161.8 ns |
-
-#### SubtreeRadixMap
-
-| Implementation | Read | Initial generation | Generate + evict |
-|---|---:|---:|---:|
-| JITArray / TreeHint | 42.5 ns | 133.0 ns | — |
-| JITArray / tuple | 44.5 ns | 119.0 ns | — |
-| ExactLRUArray / TreeHint | 53.5 ns | 109.0 ns | 189.0 ns |
-| ExactLRUArray / tuple | 53.5 ns | 107.9 ns | 188.0 ns |
-| SampledLRUArray (:clock) / TreeHint | 41.4 ns | 101.0 ns | 174.7 ns |
-| SampledLRUArray (:clock) / tuple | 40.2 ns | 98.9 ns | 174.4 ns |
-| SampledLRUArray (:sieve) / TreeHint | 42.1 ns | 107.5 ns | 179.7 ns |
-| SampledLRUArray (:sieve) / tuple | 42.3 ns | 104.6 ns | 184.3 ns |
-
-A targeted repeat checked the two largest differences from the first run:
-
-| Repeated operation | TreeHint | Tuple |
-|---|---:|---:|
-| RadixMap CLOCK generate + evict | 149.5 ns | 155.5 ns |
-| SubtreeRadixMap JIT initial generation | 123.8 ns | 124.4 ns |
-
-The apparent JIT generation improvement disappeared; the CLOCK replacement slowdown
-shrank from 13% to 4%. Ready reads in both repeated cache/map pairs allocated zero bytes
-with either representation. This is a source simplification, not a demonstrated
-consistent performance improvement.
-
-## Matrix operations with supplied outputs
-
-Run these independently of the cache benchmarks, with a maximum matrix dimension (default 16):
+Run these independently, with a maximum matrix dimension (default 16):
 
 ```sh
 julia --startup-file=no --compiled-modules=existing --project=. -e 'include("benchmark.jl"); benchmarkmatrices()'
@@ -220,24 +133,21 @@ julia --startup-file=no --compiled-modules=existing --project=. -e 'include("ben
 ```
 
 Sizes are powers of two from 2 through the specified maximum. Inputs are ordinary
-`Matrix{Float64}`; OpenBLAS is configured for one thread. Addition uses `C .= A .+ B` and
-multiplication uses `mul!(C, A, B)`, writing directly into the prepared output.
+`Matrix{Float64}`; OpenBLAS uses one thread. Addition uses `C .= A .+ B` and
+multiplication uses `mul!(C, A, B)`, writing into the supplied output.
 
-`eigh` calls LAPACK `DSYEVR`, the solver used by Julia's default symmetric eigendecomposition.
-Eigenvalues, eigenvectors, floating-point workspace, integer workspace and support buffers are
-allocated before timing; workspace sizes are queried once per size. The solver writes directly
-into the supplied outputs, without result copying. Each call copies the input into prepared
-scratch because LAPACK overwrites it; this input copy is included in the timing.
+`eigh` calls LAPACK `DSYEVR`. Eigenvalues, eigenvectors and working buffers are allocated
+before timing; workspace sizes are queried once per size. The solver writes into
+supplied outputs. Copying the input into scratch is included because LAPACK overwrites it.
 
-Each sample cycles through 64 input pairs for 4096 operations and consumes one output element
-in a scalar checksum. Fifteen rounds rotate operation order. Input preparation, compilation,
-buffer allocation and round-boundary GC are excluded. Checks cover addition, multiplication,
-eigenvalue agreement, orthogonality and reconstruction. All three operations allocate zero bytes.
-Times below are per operation.
+Each sample cycles through 64 input pairs for 4,096 operations and consumes one output
+element in a scalar checksum. Fifteen rounds rotate operation order. Input preparation,
+compilation, buffer allocation and round-boundary GC are excluded. Numerical checks
+and zero-allocation assertions pass for all three operations. Times are per operation.
 
 | Size | Addition | Multiplication | eigh |
 |---|---:|---:|---:|
-| 2×2 | 58.1 ns | 88.5 ns | 1.0 µs |
-| 4×4 | 154.4 ns | 267.3 ns | 14.5 µs |
-| 8×8 | 183.5 ns | 305.3 ns | 31.5 µs |
-| 16×16 | 542.5 ns | 783.3 ns | 93.5 µs |
+| 2×2 | 68.0 ns | 90.9 ns | 1.0 µs |
+| 4×4 | 94.0 ns | 153.0 ns | 10.5 µs |
+| 8×8 | 156.3 ns | 231.0 ns | 34.3 µs |
+| 16×16 | 310.8 ns | 795.6 ns | 95.6 µs |

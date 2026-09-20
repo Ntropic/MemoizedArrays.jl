@@ -84,17 +84,22 @@ mapslot(map, key) = JITArrays.store_lookup(map, key, JITArrays.store_hash(map, k
 end
 
 @testset "Radix adjacent levels and compressed gaps" begin
-    cache = JITArray{Tuple{Int,Int}}((i,j) -> (i,j), (0:8192,0:8192); storage=:radixtree, block_shape=(8,8))
     keys = ((0,0), (8,0), (64,0), (512,0), (4096,0), (8,8), (8192,2048), (8192,2056), (8192,2112), (1,1))
-    for key in keys
-        @test cache[key...] === key
-    end
-    @test all(key -> isready(cache, key...) && cache[key...] === key, keys)
-    treecounts(cache.map)
-    for key in reverse(keys)
-        JA.delete_key!(cache.map, key)
-        @test !isready(cache, key...)
+    for storage in (:radixtree, :subtree), block_shape in ((8,8), (4,8))
+        cache = JITArray{Tuple{Int,Int}}(tuple, (0:8192,0:8192); storage, block_shape)
+        for key in keys
+            # A compressed edge must not mistake a different leaf's same local slot for this key.
+            @test !isready(cache, key...)
+            @test cache[key...] === key
+        end
+        @test all(key -> isready(cache, key...) && cache[key...] === key, keys)
         treecounts(cache.map)
+        for key in reverse(keys)
+            JA.delete_key!(cache.map, key)
+            @test !isready(cache, key...)
+            @test all(probe -> !isready(cache, probe...) || cache[probe...] === probe, keys)
+            treecounts(cache.map)
+        end
     end
 end
 
@@ -115,12 +120,12 @@ end
     end
 end
 
-@testset "Radix domain-relative routing" begin
+@testset "Radix aligned routing preserves domain coordinates" begin
     for domain in ((-19:44, 7:71), (typemin(Int):typemax(Int), -1:typemax(Int)))
         calls = Ref(0)
         cache = JITArray{Tuple{Int,Int}}((i,j) -> (calls[] += 1; (i,j)), domain; storage=:radixtree, block_shape=(8,8))
         for key in ((first(domain[1]),first(domain[2])), (last(domain[1]),last(domain[2])), (0,7))
-            expected = ntuple(i -> UInt(big(key[i]) - first(domain[i])), 2)
+            expected = ntuple(i -> UInt(mod(big(key[i]) + JA.tree_offset(cache.map)[i], big(1) << (8sizeof(UInt)))), 2)
             @test JA.store_hash(cache.map, key) == expected
             @test !isready(cache, key...)
             @test cache[key...] == cache[key...] == key
@@ -134,7 +139,7 @@ end
 @testset "Tree ArrayMap sentinels" begin
     matrix = ones(4, 4)
     values = (nothing, false, 0, matrix, view(matrix, 1:2, 1:2))
-    for storage in (:radixtree, :subtreetree)
+    for storage in (:radixtree, :subtree)
         calls = Ref(0)
         cache = JITArray{Any}(i -> (calls[] += 1; values[i ÷ 64 + 1]), 0:256; storage, block_shape=(8,))
         @test cache.map.roots.empty isa JA.TreeLeaf
@@ -158,9 +163,9 @@ end
 end
 
 @testset "Radix read path and generation" begin
-    for seed in (false, true)
+    for storage in (:radixtree, :subtree), seed in (false, true)
         calls = Dict{Tuple{Int,Int},Int}()
-        cache = JITArray{Int}((-32:1023, -32:1023); storage=:radixtree, block_shape=(4,8)) do i, j
+        cache = JITArray{Int}((-32:1023, -32:1023); storage, block_shape=(4,8)) do i, j
             key = (i,j)
             slot = mapslot(cache.map, key)
             @test slot !== nothing && JA.slot_entry(slot) === cache.map.empty
@@ -186,6 +191,25 @@ end
     end
     scalar = JITArray{Int}(() -> 17, (); storage=:radixtree, block_shape=())
     @test scalar[] == scalar[] == 17
+end
+
+@testset "Subtree reads retain generated view parents" begin
+    parents = WeakRef[]
+    makeview = (i, j) -> begin
+        matrix = [i j; j i]
+        push!(parents, WeakRef(matrix))
+        return view(matrix, 1:1, 1:1)
+    end
+    cache = JITArray{typeof(view(zeros(Int, 2, 2), 1:1, 1:1))}(makeview,
+        unbound(2); storage=:subtree, block_shape=(4,8))
+    keys = ((0,0), (1,0), (128,-128))
+    for key in keys
+        @test cache[key...][1,1] == key[1]
+    end
+    GC.gc(true)
+    for (i, key) in enumerate(keys)
+        @test parent(cache[key...]) === parents[i].value !== nothing
+    end
 end
 
 @testset "Radix root prefix compression" begin
@@ -217,35 +241,149 @@ end
 @testset "Depth shortcuts share the radix tree" begin
     JA = JITArrays
     map = JA.SubtreeRadixMap(Union{JA.Empty,MapTestEntry{2}},
-        (typemin(Int):typemax(Int), typemin(Int):typemax(Int)), (8,8), JA.EMPTY)
-    keys = ((3,0), (-4,0), (4,0), (31,0), (32,0), (0,32))
+        (-19:typemax(Int), -11:typemax(Int)), (8,8), JA.EMPTY)
+    keys = ((0,0), (-1,0), (5,0), (44,0), (45,0), (0,53))
+    @test map.zero == JA.tree_offset(map)
+    @test map.zero_path[1] != 1
+    @test all(level -> map.zero_path[level + 1] == JA.tree_address(map, map.zero, level), 0:length(map.zero_path)-1)
+    @test JA.rootindex(map, JA.store_hash(map, (0,0))) == 1
     for key in keys
-        slot = JA.store_reserve!(map, key, JA.tree_key(key))
+        slot = JA.store_reserve!(map, key, JA.store_hash(map, key))
         JA.slot_publish!(slot, MapTestEntry(key))
         JA.store_retain!(map, slot)
     end
     @test length(map.roots.reference.mem) == cld(8sizeof(UInt), 3)
-    @test map.roots.reference.mem[1] === mapslot(map, (3,0)).leaf === mapslot(map, (-4,0)).leaf
+    @test map.roots.reference.mem[1] === mapslot(map, (0,0)).leaf === mapslot(map, (-1,0)).leaf
     @test map.roots.reference.mem[2] isa JA.TreeBranch
     @test map.roots.reference.mem[3] isa JA.TreeBranch
     smallroots = Tuple(map.roots.reference.mem[1:3])
-    distantkey = (typemin(Int), typemax(Int))
-    distant = JA.store_reserve!(map, distantkey, JA.tree_key(distantkey))
+    distantkey = (typemax(Int), typemax(Int))
+    distant = JA.store_reserve!(map, distantkey, JA.store_hash(map, distantkey))
     JA.slot_publish!(distant, MapTestEntry(distantkey))
     JA.store_retain!(map, distant)
     @test map.roots.reference.mem[end] isa JA.TreeBranch
     @test JA.node_level(map.roots.reference.mem[end]) == length(map.roots.reference.mem)-1
     @test all(i -> map.roots.reference.mem[i] === smallroots[i], 1:3)
-    for key in ((4,0), (31,0), distantkey)
+    for key in ((5,0), (44,0), distantkey)
         JA.delete_key!(map, key)
     end
-    @test map.roots.reference.mem[2] === map.roots.reference.mem[1]
+    @test map.roots.reference.mem[2] === map.roots.reference.mem[3]
     @test map.roots.reference.mem[end] === map.roots.reference.mem[3]
-    @test all(key -> JA.slot_entry(mapslot(map, key)).key == key, ((3,0), (-4,0), (32,0), (0,32)))
-    @test mapslot(map, (4,0)) === nothing || JA.slot_entry(mapslot(map, (4,0))) isa JA.Empty
-    @test all(node -> node === map.roots.empty || JA.node_level(node) <= findfirst(==(node), map.roots.reference.mem)-1, map.roots.reference.mem)
+    @test all(key -> JA.slot_entry(mapslot(map, key)).key == key, ((0,0), (-1,0), (45,0), (0,53)))
+    @test mapslot(map, (5,0)) === nothing || JA.slot_entry(mapslot(map, (5,0))) isa JA.Empty
     @test treecounts(map)[2] == 3
     treecounts(map)
+end
+
+@testset "Subtree insertion across missing shortcuts" begin
+    for center in (0.5, -0.5)
+        cache = JITArray{Int}(identity, unbound(1); storage=:subtree, block_shape=(8,), center)
+        function checkshortcuts()
+            map = cache.map
+            for key in (0, 8, 64, 72, 512, -512, 4096, 8192, typemin(Int), typemax(Int))
+                encoded = JA.store_hash(map, (key,))
+                direct = JA.treefind(map, encoded, JA.rootlink(map), length(map.zero_path)-1, Val(false))
+                shortcut = mapslot(map, (key,))
+                @test (direct === nothing && shortcut === nothing) ||
+                    (direct !== nothing && shortcut !== nothing && direct.leaf === shortcut.leaf)
+            end
+        end
+        # Start off the zero path, split compressed edges, then fill missing lower levels.
+        keys = (64, 72, 4096, 0, 8, 512, -512)
+        for key in keys
+            @test !isready(cache, key)
+            @test cache[key] == key
+            treecounts(cache.map)
+            checkshortcuts()
+        end
+        for key in (0, 8, 4096)
+            JA.delete_key!(cache.map, (key,))
+            checkshortcuts()
+        end
+        for key in (1, 9, 8192)
+            @test !isready(cache, key)
+            @test cache[key] == key
+            treecounts(cache.map)
+            checkshortcuts()
+        end
+        @test all(key -> isready(cache, key) && cache[key] == key, (64, 72, 512, -512, 1, 9, 8192))
+        @test all(key -> !isready(cache, key), (0, 8, 4096))
+    end
+end
+
+@testset "Skipped subtree depths select an existing ancestor" begin
+    cache = JITArray{Int}(identity, unbound(1); storage=:subtree, block_shape=(8,))
+    @test cache[0] == 0
+    @test cache[4096] == 4096
+    map = cache.map
+    root = map.roots.reference.mem[end]
+    @test root.level > 1
+    @test all(i -> map.roots.reference.mem[i] === root, 2:root.level+1)
+    @test map.roots.reference.mem[1] === mapslot(map, (0,)).leaf
+    @test cache[8] == 8
+    JA.delete_key!(map, (0,))
+    @test map.roots.reference.mem[1] === root
+    @test !isready(cache, 0)
+    @test cache[0] == 0
+    @test all(i -> isready(cache, i) && cache[i] == i, (0, 8, 4096))
+    treecounts(map)
+end
+
+@testset "Subtree zero-path routing and pruning" begin
+    for byslot in (false, true)
+        map = JA.SubtreeRadixMap(Any, (typemin(Int):typemax(Int),), (8,), JA.EMPTY)
+        for key in ((0,), (typemin(Int),))
+            slot = JA.store_reserve!(map, key, JA.store_hash(map, key))
+            JA.slot_publish!(slot, key)
+            JA.store_retain!(map, slot)
+        end
+        if byslot
+            JA.store_delete!(map, (0,), mapslot(map, (0,)))
+        else
+            JA.delete_key!(map, (0,))
+        end
+        @test all(node -> node === map.roots.empty, map.roots.reference.mem[1:end-1])
+        @test JA.slot_entry(mapslot(map, (typemin(Int),))) == (typemin(Int),)
+    end
+    # Above an off-zero compressed child, retain the ancestor; a root may stand alone.
+    for distant in ((), (512,))
+        map = JA.SubtreeRadixMap(Any, (0:1024,), (8,), JA.EMPTY)
+        for i in (64, 72, distant...)
+            slot = JA.store_reserve!(map, (i,), JA.store_hash(map, (i,)))
+            JA.slot_publish!(slot, i)
+            JA.store_retain!(map, slot)
+        end
+        @test map.roots.reference.mem[3] isa JA.TreeBranch
+        JA.delete_key!(map, (64,))
+        @test map.roots.reference.mem[3] === (isempty(distant) ? mapslot(map, (72,)).leaf : map.roots.reference.mem[4])
+        JA.delete_key!(map, (72,))
+        @test map.roots.reference.mem[3] === map.roots.empty
+    end
+    for domain in ((1:8,), (-8:-1,), (0:8, 1:8), (1:0,))
+        @test_throws ArgumentError JA.SubtreeRadixMap(Any, domain, ntuple(_ -> 8, length(domain)), JA.EMPTY)
+    end
+    for domain in ((-19:100, -11:100), (typemin(Int):typemax(Int), typemin(Int):typemax(Int))),
+        block in ((8,8), (4,8)), policy in (:exact, :sieve)
+        cache = LRUArray{Tuple{Int,Int}}(tuple, domain; capacity=3, policy,
+            storage=:subtree, block_shape=block)
+        normal = JA.RadixMap(Any, domain, block, JA.EMPTY)
+        keys = [(mod(37i, 120)-19, mod(53i, 112)-11) for i in 0:39]
+        append!(keys, [(0,0), (first(domain[1]),first(domain[2])), (last(domain[1]),last(domain[2])), (0,0)])
+        for key in keys
+            @test cache[key...] == key
+            @test JA.store_hash(cache.map, key) == JA.store_hash(normal, key)
+            for probe in (key, (0,0), (-1,-1), (1,1))
+                encoded = JA.store_hash(cache.map, probe)
+                direct = JA.treefind(cache.map, encoded, JA.rootlink(cache.map),
+                    length(cache.map.zero_path)-1, Val(false))
+                shortcut = mapslot(cache.map, probe)
+                @test (direct === nothing && shortcut === nothing) ||
+                    (direct !== nothing && shortcut !== nothing && direct.leaf === shortcut.leaf &&
+                     direct.reference === shortcut.reference)
+            end
+            treecounts(cache.map)
+        end
+    end
 end
 
 @testset "Dictionary stable records, collisions, and tombstones" begin

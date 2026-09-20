@@ -32,7 +32,7 @@
     @test !checkindex(Bool, full, big(typemax(Int)) + 1)
     @test !checkindex(Bool, full, Inf)
     scalar = JITArray{Int}(() -> 7, UnitRange{Int}[])
-    @test scalar.map isa JA.DictMap
+    @test scalar.map isa JA.ArrayMap
     @test scalar[] == scalar[1] == 7
     @test_throws ArgumentError SparseJITArray{Int}(identity; ndims=-1)
     @test_throws ArgumentError JITArray{Int}(identity, 1:3; storage=:unknown)

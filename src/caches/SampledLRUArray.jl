@@ -1,12 +1,4 @@
-# Approximate LRU caches: CLOCK scans resident slots; SIEVE scans insertion order.
-# Policy and field layouts are type parameters; reads only mark entries as visited.
-
-mutable struct ClockEntry{V,Key} <: AbstractEntry{V}
-    key::Key
-    visited::Bool
-    value::V
-    ClockEntry{V,Key}() where {V,Key} = new{V,Key}()
-end
+# Approximate policies reuse pooled entries; reads update only entry recency.
 
 mutable struct SieveEntry{V,Key} <: AbstractEntry{V}
     key::Key
@@ -17,86 +9,161 @@ mutable struct SieveEntry{V,Key} <: AbstractEntry{V}
     SieveEntry{V,Key}() where {V,Key} = new{V,Key}()
 end
 
-"""`SampledLRUArray{V}(generator, dims...; capacity, policy=:clock, kwargs...)`: policies `:clock` (default), `:sieve`."""
-mutable struct SampledLRUArray{V,N,M,G,Policy,E,A,L,H} <: AbstractJITArray{V,N,M}
+mutable struct BatchEntry{R,V,Key} <: AbstractEntry{V}
+    key::Key
+    recent::R
+    value::V
+    BatchEntry{R,V,Key}() where {R,V,Key} = new{R,V,Key}()
+end
+
+mutable struct BatchState{E}
+    const queue::Memory{E}
+    head::Int
+    tail::Int
+    nfree::Int
+    const blocksize::Int
+    epoch::UInt
+    const keep_epochs::UInt
+end
+
+"""
+    SampledLRUArray{V}(generator, domain; capacity, policy=:sieve, batch_size=nothing, keep_epochs=nothing, kwargs...)
+
+Approximate LRU with `:sieve` (default), `:batch_reinsert`, or `:batch_age`. Batch policies process
+`batch_size` entries at a time (default 64, limited by capacity). Age retention uses
+`keep_epochs` processed blocks; its default is at least four blocks and one pool pass.
+"""
+mutable struct SampledLRUArray{V,N,M,G,Policy,E,A,L,H,D,Offset,R} <: AbstractJITArray{V,N,M}
     const capacity::Int
     count::Int
     const active::A
     oldest::L
     newest::L
     hand::H
+    const recency::R
+    const domain::D
     const map::M
     const generator::G
 end
 
-function SampledLRUArray{V}(generator::G, domain::VT{N,T}; capacity::Int, policy::Symbol=:clock,
-    storage=nothing, block_shape=nothing) where {V,G,N,T<:Union{Int,AbstractUnitRange{Int}}}
-    capacity < 1 && throw(ArgumentError("capacity must be positive"))
-    storage = domain_storage(domain, storage)
-    @astuple length(domain) domain
-    domain = axis_domain(domain, storage)
-    Key = entry_keytype(domain, storage)
-    if policy === :clock
-        E = ClockEntry{V,Key}
-        active, oldest, newest, hand = preallocate(E, capacity), nothing, nothing, 1
-        L, H = Nothing, Int
-    elseif policy === :sieve
+function SampledLRUArray{V}(generator::G, domain::VT{N,T}; capacity::Int, policy::Symbol=:sieve,
+    storage=nothing, block_shape=nothing, center=nothing, batch_size::Union{Nothing,Int}=nothing,
+    keep_epochs::Union{Nothing,Int}=nothing) where {V,G,N,T}
+    if capacity < 1
+        throw(ArgumentError("capacity must be positive"))
+    end
+    if !(policy in (:sieve, :batch_reinsert, :batch_age))
+        throw(ArgumentError("unknown approximate LRU policy $policy; use :sieve, :batch_reinsert, or :batch_age"))
+    end
+    if batch_size !== nothing && (policy === :sieve || batch_size < 1)
+        throw(ArgumentError("batch_size must be positive and applies only to :batch_reinsert or :batch_age"))
+    end
+    if keep_epochs !== nothing && (policy !== :batch_age || keep_epochs < 1)
+        throw(ArgumentError("keep_epochs must be positive and applies only to :batch_age"))
+    end
+    kind = policy === :sieve ? SieveEntry : policy === :batch_reinsert ? BatchEntry{Bool} : BatchEntry{UInt}
+    map, domain = make_cache_map(kind, V, domain, storage, block_shape, center)
+    Key = map isa ArrayMap ? Int : NTuple{length(domain),Int}
+    if policy === :sieve
         E = SieveEntry{V,Key}
-        active, oldest, newest, hand = preallocate(E, capacity), nothing, nothing, nothing
+        recency = nothing
         L = H = Union{Nothing,E}
     else
-        throw(ArgumentError("unknown approximate LRU policy $policy; use :clock or :sieve"))
+        E = kind{V,Key}
+        blocksize = min(capacity, batch_size === nothing ? 64 : batch_size)
+        window = keep_epochs === nothing ? max(4, cld(capacity, blocksize)) : keep_epochs
+        recency = BatchState(Memory{E}(undef, capacity), 1, 1, capacity, blocksize, UInt(1), UInt(window))
+        L = H = Nothing
     end
-    map = make_map(Union{Empty,E}, domain, storage, block_shape)
-    return SampledLRUArray{V,length(domain),typeof(map),G,policy,E,typeof(active),L,H}(
-        capacity, 0, active, oldest, newest, hand, map, generator)
+    active = preallocate(E, capacity)
+    offset = routing_offset(map)
+    return SampledLRUArray{V,length(domain),typeof(map),G,policy,E,typeof(active),L,H,typeof(domain),offset,typeof(recency)}(
+        capacity, 0, active, nothing, nothing, nothing, recency, domain, map, generator)
 end
 
-SampledLRUArray{V}(generator, dims::Int...; kwargs...) where V = SampledLRUArray{V}(generator, dims; kwargs...)
-SampledLRUArray{V}(generator, axis::AbstractUnitRange{Int}, axes::AbstractUnitRange{Int}...; kwargs...) where V = SampledLRUArray{V}(generator, (axis, axes...); kwargs...)
+@inline cache_offset(::SampledLRUArray{V,N,M,G,P,E,A,L,H,D,O}) where {V,N,M,G,P,E,A,L,H,D,O} = Val(O)
+
+SampledLRUArray{V}(generator, axis::Union{Int,AbstractUnitRange{Int}}, axes::Union{Int,AbstractUnitRange{Int}}...; kwargs...) where V = SampledLRUArray{V}(generator, (axis, axes...); kwargs...)
 SampledLRUArray{V}(domain::VT{N,T}, capacity::Int, generator::Function; kwargs...) where {V,N,T} = SampledLRUArray{V}(generator, domain; capacity, kwargs...)
 @inline entrytype(::SampledLRUArray{V,N,M,G,P,E}) where {V,N,M,G,P,E} = E
 
-# CLOCK: F. J. Corbató, A Paging Experiment with the Multics System (1969).
-# https://multicians.org/paging-experiment.pdf
-function victim!(cache::SampledLRUArray{V,N,M,G,:clock}) where {V,N,M,G}
-    @inbounds while true
-        index = cache.hand
-        cache.hand = index == cache.capacity ? 1 : index + 1
-        stored = cache.active[index]
-        if !stored.visited
-            return index
-        end
-        stored.visited = false
-    end
+@inline function batchappend!(cache, stored)
+    state = cache.recency
+    @inbounds state.queue[state.tail] = stored
+    state.tail = state.tail == cache.capacity ? 1 : state.tail + 1
+    return nothing
 end
 
-@inline function cacheget(cache::SampledLRUArray{V,N,M,G,:clock,E}, key, indices=nothing) where {V,N,M,G,E}
-    routing = store_hash(cache.map, key)
+@inline function batchtouch!(state, stored::BatchEntry{Bool})
+    if !stored.recent
+        stored.recent = true
+    end
+    return nothing
+end
+@inline function batchtouch!(state, stored::BatchEntry{UInt})
+    if stored.recent != state.epoch
+        stored.recent = state.epoch
+    end
+    return nothing
+end
+@inline batchrecent(state, stored::BatchEntry{Bool}) = stored.recent
+@inline batchrecent(state, stored::BatchEntry{UInt}) =
+    stored.recent != 0 && state.epoch - stored.recent < state.keep_epochs
+@inline batchreset!(stored::BatchEntry{Bool}) = (stored.recent = false)
+@inline batchreset!(stored::BatchEntry{UInt}) = nothing
+
+function batchclean!(cache)
+    state = cache.recency
+    # A block bounds one pass, not total cleanup: reused entries may survive several passes.
+    while state.nfree == 0
+        for _ in 1:min(state.blocksize, cache.count)
+            @inbounds stored = state.queue[state.head]
+            state.head = state.head == cache.capacity ? 1 : state.head + 1
+            if batchrecent(state, stored)
+                batchreset!(stored)
+                batchappend!(cache, stored)
+            else
+                delete_entry!(cache, stored.key)
+                state.nfree += 1
+                @inbounds cache.active[state.nfree] = stored
+                cache.count -= 1
+            end
+        end
+        state.epoch += UInt(1)
+    end
+    return nothing
+end
+
+@inline function cacheget(cache::SampledLRUArray{V,N,M,G,P,E}, key, indices=nothing) where {V,N,M,G,P,E<:BatchEntry}
+    routing = cache_routing(cache, key)
     slot, hint = prepare(cache.map, key, routing)
     if slot !== nothing
         stored = preparedentry(slot, hint)
-        if stored isa E
-            if !stored.visited
-                stored.visited = true
-            end
+        if stored !== cache.map.empty
+            batchtouch!(cache.recency, stored)
             return stored.value
         end
     end
     generated = cache.generator(generator_indices(cache, key, indices)...)
     value = generated isa V ? generated : convert(V, generated)
-    if cache.count == cache.capacity
-        index = victim!(cache)
-        @inbounds stored = cache.active[index]
-        delete_key!(cache.map, stored.key)
-        stored.key, stored.value, stored.visited = key, value, true
-    else
-        @inbounds stored = cache.active[cache.count + 1]
-        stored.key, stored.value, stored.visited = key, value, true
-        cache.count += 1
+    if cache.map isa TreeMap
+        # Retain the destination before cleanup so evicting its last old value cannot prune it.
+        slot = reserve!(cache.map, key, routing, slot, hint)
+        store_retain!(cache.map, slot)
     end
-    slot = reserve!(cache.map, key, routing, slot, hint)
-    store_retain!(cache.map, slot)
+    if cache.recency.nfree == 0
+        batchclean!(cache)
+    end
+    @inbounds stored = cache.active[cache.recency.nfree]
+    cache.recency.nfree -= 1
+    stored.key, stored.value = key, value
+    stored.recent = P === :batch_reinsert ? false : UInt(0)
+    batchappend!(cache, stored)
+    cache.count += 1
+    if !(cache.map isa TreeMap)
+        slot = reserve!(cache.map, key, routing, slot, hint)
+        store_retain!(cache.map, slot)
+    end
     slot_publish!(slot, stored)
     return value
 end
@@ -113,8 +180,8 @@ function victim!(cache::SampledLRUArray{V,N,M,G,:sieve}) where {V,N,M,G}
     return stored
 end
 
-@inline function cacheget(cache::SampledLRUArray{V,N,M,G,:sieve,E}, key, indices=nothing) where {V,N,M,G,E}
-    routing = store_hash(cache.map, key)
+@inline function cacheget(cache::SampledLRUArray{V,N,M,G,:sieve,E}, key, indices=nothing) where {V,N,M,G,E<:SieveEntry}
+    routing = cache_routing(cache, key)
     slot, hint = prepare(cache.map, key, routing)
     if slot !== nothing
         stored = preparedentry(slot, hint)
@@ -129,7 +196,7 @@ end
     value = generated isa V ? generated : convert(V, generated)
     if cache.count == cache.capacity
         stored = victim!(cache)
-        delete_key!(cache.map, stored.key)
+        delete_entry!(cache, stored.key)
         if stored.previous === nothing
             cache.oldest = stored.next
         else

@@ -15,6 +15,8 @@ const PRECOMPUTED_VALUE = fill(1.0, 4, 4)
 @inline readvalue(cache, key::Tuple) = @inbounds cache[key...]
 @inline replacement(key::Int) = key + CAPACITY
 @inline replacement(key::Tuple) = (key[1] + 128, Base.tail(key)...)
+@inline replacement(key, ::Val{:churn}) = replacement(key)
+@inline replacement(key::Tuple, ::Val{:centralchurn}) = (key[1] + 4, Base.tail(key)...)
 
 @inline mapread(map, key) = get(map, key, nothing)
 @inline mapread(cache::AbstractJITArray, key) = readvalue(cache, key)
@@ -37,15 +39,13 @@ mapsizehint!(map::JITArrays.DictMap) = JITArrays.hash_rebuild!(map, 2CAPACITY)
 
 @inline operation!(map, key, ::Val{:read}) = mapread(map, key)
 @inline operation!(map, key, ::Val{:insert}) = mapinsert!(map, key)
-@inline function operation!(map, key, ::Val{:delete})
+@inline operation!(map, key, ::Val{:central}) = mapinsert!(map, key)
+@inline function operation!(map, key, operation::Union{Val{:churn},Val{:centralchurn}})
     mapdelete!(map, key)
-    return PRECOMPUTED_VALUE
+    return mapinsert!(map, replacement(key, operation))
 end
-@inline function operation!(map, key, ::Val{:churn})
-    mapdelete!(map, key)
-    return mapinsert!(map, replacement(key))
-end
-@inline operation!(cache::AbstractJITArray, key, ::Val{:churn}) = readvalue(cache, replacement(key))
+@inline operation!(cache::AbstractJITArray, key, operation::Union{Val{:churn},Val{:centralchurn}}) =
+    readvalue(cache, replacement(key, operation))
 @inline function operation!(map, key, ::Val{:threshold})
     mapdelete!(map, key)
     return mapinsert!(map, key)
@@ -87,18 +87,24 @@ end
 hasvalue(cache::AbstractJITArray, key) = isready(cache, key)
 hasvalue(map, key) = mapread(map, key) === PRECOMPUTED_VALUE
 
+benchmarkleaf(cache::AbstractJITArray, key) = benchmarkleaf(cache.map, key)
+benchmarkleaf(map::JITArrays.TreeMap, key) =
+    JITArrays.store_lookup(map, key, JITArrays.store_hash(map, key)).leaf
+
 function comparemaps(names, makers, warmkeys, requestkeys, operations, results=Tuple{String,String,Float64}[])
     for (label, operation) in operations
-        residents = operation === :threshold ? 48 : CAPACITY
-        keys = operation === :read ? requestkeys : operation === :threshold ?
+        residents = operation === :threshold ? 48 : operation === :central ? length(warmkeys) : CAPACITY
+        keys = operation in (:read, :central, :centralchurn) ? requestkeys : operation === :threshold ?
             [warmkeys[mod(i - 1, residents) + 1] for i in 1:CAPACITY] : warmkeys
-        checked = operation === :churn ? replacement.(warmkeys) : view(warmkeys, 1:residents)
+        replacing = operation in (:churn, :centralchurn)
+        checked = replacing ? replacement.(keys, Ref(Val(operation))) :
+            operation === :central ? requestkeys : view(warmkeys, 1:residents)
         function setup(make)
             maps = [make() for _ in 1:GENERATION_CACHES]
             for map in maps
                 if operation === :reserved
                     mapsizehint!(map)
-                elseif operation in (:read, :delete, :churn, :threshold)
+                elseif operation in (:read, :churn, :centralchurn, :threshold, :central)
                     for i in 1:residents
                         mapinsert!(map, warmkeys[i])
                     end
@@ -110,27 +116,58 @@ function comparemaps(names, makers, warmkeys, requestkeys, operations, results=T
         for make in makers
             measured(setup(make), keys, Val(operation))
         end
+        batches = operation === :central ? 8 : operation === :centralchurn ? 16 : 1
+        if operation === :central
+            @assert length(unique(keys)) == length(keys)
+        end
+        if operation === :centralchurn
+            @assert length(unique(warmkeys)) == CAPACITY
+            @assert length(unique(checked)) == length(keys) == 32
+            @assert keys == warmkeys[1:32]
+            @assert isempty(intersect(warmkeys, checked))
+            inner = -Int(JITArrays.tree_offset((8,8), true)[1] & UInt(7))
+            @assert all(key -> all(axis -> inner <= axis < inner + 8, key), [keys; checked])
+        end
         for round in 1:ROUNDS
             GC.gc()
             for i in circshift(collect(eachindex(makers)), round)
-                maps = setup(makers[i])
-                push!(samples[i], measured(maps, keys, Val(operation)))
-                for map in maps
-                    expected = operation === :delete ? 0 : residents
-                    if map isa AbstractDict
-                        @assert length(map) == expected
-                    elseif map isa JITArrays.DictMap
-                        @assert map.count == expected
+                total = (0.0, 0.0, 0.0)
+                for batch in 1:batches
+                    maps = setup(makers[i])
+                    central = operation in (:central, :centralchurn) ? [benchmarkleaf(map, first(warmkeys)) for map in maps] : nothing
+                    if operation in (:central, :centralchurn)
+                        missing = operation === :central ? keys : checked
+                        @assert all(map -> all(key -> !hasvalue(map, key), missing), maps)
                     end
-                    if operation !== :delete && !(operation === :churn && map isa AbstractJITArray)
-                        @assert all(key -> hasvalue(map, key), checked)
-                    end
-                    if operation === :delete || (operation === :churn && !(map isa AbstractJITArray))
-                        @assert all(key -> !hasvalue(map, key), warmkeys)
-                    elseif operation === :churn
-                        @assert count(key -> hasvalue(map, key), [warmkeys; checked]) == residents
+                    total = Base.map(+, total, measured(maps, keys, Val(operation)))
+                    for (j, map) in enumerate(maps)
+                        if operation === :central
+                            @assert all(key -> benchmarkleaf(map, key) === central[j], keys)
+                            @assert all(key -> hasvalue(map, key), warmkeys)
+                            @assert !(map isa AbstractJITArray) || map isa JITArray || map.count == residents + length(keys)
+                        end
+                        if operation === :centralchurn
+                            @assert all(key -> benchmarkleaf(map, key) === central[j], checked)
+                            @assert all(key -> !hasvalue(map, key), keys)
+                            @assert all(key -> hasvalue(map, key), checked)
+                            @assert all(key -> hasvalue(map, key), warmkeys[33:end])
+                        end
+                        if map isa AbstractDict
+                            @assert length(map) == residents
+                        elseif map isa JITArrays.DictMap
+                            @assert map.count == residents
+                        end
+                        if !(replacing && map isa AbstractJITArray)
+                            @assert all(key -> hasvalue(map, key), checked)
+                        end
+                        if replacing && !(map isa AbstractJITArray)
+                            @assert all(key -> !hasvalue(map, key), keys)
+                        elseif replacing
+                            @assert count(key -> hasvalue(map, key), [warmkeys; checked]) == map.count <= residents
+                        end
                     end
                 end
+                push!(samples[i], Base.map(value -> value / batches, total))
             end
         end
         for i in eachindex(makers)
@@ -141,11 +178,11 @@ function comparemaps(names, makers, warmkeys, requestkeys, operations, results=T
 end
 
 # Optional external comparison: using DataStructures; comparetrees(SortedDict, Trie).
-function comparetrees(SortedDict, Trie; maps=(:radixtree, :subtreetree))
-    @assert !isempty(maps) && all(m -> m in (:radixtree, :subtreetree), maps) "Trees: radixtree, subtreetree"
+function comparetrees(SortedDict, Trie; maps=(:radixtree, :subtree))
+    @assert !isempty(maps) && all(m -> m in (:radixtree, :subtree), maps) "Trees: radixtree, subtree"
     println("Julia ", VERSION, "; DataStructures ", pkgversion(parentmodule(SortedDict)), "; ", ROUNDS, " interleaved rounds.")
     domain = (typemin(Int):typemax(Int), typemin(Int):typemax(Int))
-    constructors = (radixtree=JITArrays.RadixMap, subtreetree=JITArrays.SubtreeRadixMap)
+    constructors = (radixtree=JITArrays.RadixMap, subtree=JITArrays.SubtreeRadixMap)
     selected = Tuple(unique(maps))
     trees = map(selected) do storage
         Map = constructors[storage]
@@ -171,23 +208,53 @@ function comparetrees(SortedDict, Trie; maps=(:radixtree, :subtreetree))
         results = Tuple{String,String,Float64}[]
         comparemaps(names, makers, warm, requests, (("Lookup", :read), ("Insert", :insert)), results)
         # DataStructures.Trie has no deletion operation.
-        comparemaps(names[1:end-1], makers[1:end-1], warm, requests, (("Delete", :delete), ("Delete + insert", :churn)), results)
+        comparemaps(names[1:end-1], makers[1:end-1], warm, requests, (("Replace", :churn),), results)
         benchmarktable(results)
     end
 end
 
-function benchmark(; maps=(:array, :dict, :radixtree, :subtreetree), caches=(:jit, :exact, :clock, :sieve))
-    @assert !isempty(maps) && all(m -> m in (:array, :dict, :radixtree, :subtreetree), maps) "Maps: array, dict, radixtree, subtreetree"
-    @assert !isempty(caches) && all(c -> c in (:jit, :exact, :clock, :sieve), caches) "Caches: jit, exact, clock, sieve"
+tree_generation_keys() = [(2mod(i,32)-3, 2div(i,32)-3) for i in 0:CAPACITY-1]
+
+function tree_read_samples()
+    rng = Xoshiro(2026)
+    offset = JITArrays.tree_offset((8,8), true)[1]
+    bounds = [(-Int(offset & UInt(8^depth-1)), 8^depth) for depth in 1:4]
+    inner, size = first(bounds)
+    resident = [(x,y) for x in inner:inner+size-1 for y in inner:inner+size-1]
+    lower, width = last(bounds)
+    while length(resident) < CAPACITY
+        key = (rand(rng,lower:lower+width-1), rand(rng,lower:lower+width-1))
+        if !(key in resident)
+            push!(resident,key)
+        end
+    end
+    bands = [1:64,65:CAPACITY]
+    # Two extremes: widely scattered resident keys, or only the central leaf.
+    uniform = [resident[65+mod(i, CAPACITY-64)] for i in 0:32767]
+    shuffle!(rng,uniform)
+    clustered = repeat(resident[1:64],512)
+    shuffle!(rng,clustered)
+    @assert length(resident) == length(unique(resident)) == CAPACITY
+    @assert length(uniform) == length(clustered) == 32768
+    @assert all(key -> all(i -> inner <= i < inner+size,key),clustered)
+    @assert all(key -> !all(i -> inner <= i < inner+size,key),uniform)
+    return (; resident,uniform,clustered,bounds,bands)
+end
+
+function benchmark(; maps=(:array, :dict, :radixtree, :subtree), caches=(:jit, :exact, :sieve, :batch_reinsert, :batch_age))
+    @assert !isempty(maps) && all(m -> m in (:array, :dict, :radixtree, :subtree), maps) "Maps: array, dict, radixtree, subtree"
+    @assert !isempty(caches) && all(c -> c in (:jit, :exact, :sieve, :batch_reinsert, :batch_age), caches) "Caches: jit, exact, sieve, batch_reinsert, batch_age"
     println("Julia ", VERSION, "; ", ROUNDS, " rotated rounds; ", GENERATION_CACHES, " containers per sample.")
     println("One timed loop, one matrix-element checksum/request; no output-array writes. Setup and prefill are untimed; full GC precedes each round. GC during operations is included.")
     println("Insertion/cache miss stores one precomputed matrix. Ready reads and misses use the same loop.")
     for storage in unique(maps)
-        shape = storage in (:radixtree, :subtreetree) ? (8, 8) : nothing
+        shape = storage in (:radixtree, :subtree) ? (8, 8) : nothing
         domain = storage === :array ? (4096,) : (typemin(Int):typemax(Int), typemin(Int):typemax(Int))
         options = (; storage=storage === :array ? nothing : storage, block_shape=shape)
-        constructors = (jit=JITArray{Value}, exact=ExactLRUArray{Value}, clock=SampledLRUArray{Value}, sieve=SampledLRUArray{Value})
-        names = (jit="JITArray", exact="ExactLRUArray", clock="SampledLRUArray (:clock)", sieve="SampledLRUArray (:sieve)")
+        constructors = (jit=JITArray{Value}, exact=ExactLRUArray{Value}, sieve=SampledLRUArray{Value},
+            batch_reinsert=SampledLRUArray{Value}, batch_age=SampledLRUArray{Value})
+        names = (jit="JITArray", exact="ExactLRUArray", sieve="SampledLRUArray (:sieve)",
+            batch_reinsert="SampledLRUArray (:batch_reinsert)", batch_age="SampledLRUArray (:batch_age)")
         selected = Tuple(unique(caches))
         makers = map(selected) do policy
             constructor = constructors[policy]
@@ -196,6 +263,10 @@ function benchmark(; maps=(:array, :dict, :radixtree, :subtreetree), caches=(:ji
         end
         labels = map(policy -> names[policy], selected)
         warm = storage === :array ? collect(1:CAPACITY) : [(2mod(i, 32), 2div(i, 32)) for i in 1:CAPACITY]
+        if storage in (:radixtree, :subtree)
+            # Sixteen residents per leaf for initial population and ordinary replacement.
+            warm = tree_generation_keys()
+        end
         requests = [warm[mod(i * 73, CAPACITY) + 1] for i in 1:32768]
         if storage === :array
             rawlabels, rawmakers = ("Array",), (() -> Vector{Value}(undef, 4096),)
@@ -209,30 +280,56 @@ function benchmark(; maps=(:array, :dict, :radixtree, :subtreetree), caches=(:ji
         end
         println("\n## ", storage)
         results = Tuple{String,String,Float64}[]
-        comparemaps((rawlabels..., labels...), (rawmakers..., makers...), warm, requests,
-            (("Read", :read), ("Initial generation / insertion", :insert)), results)
+        if storage in (:radixtree, :subtree)
+            sampling = tree_read_samples()
+            comparemaps((rawlabels..., labels...), (rawmakers..., makers...), sampling.resident, sampling.uniform,
+                (("Read (spread out)", :read),), results)
+            comparemaps((rawlabels..., labels...), (rawmakers..., makers...), sampling.resident, sampling.clustered,
+                (("Read (central leaf)", :read),), results)
+            comparemaps((rawlabels..., labels...), (rawmakers..., makers...), warm, requests,
+                (("Initial generation / insertion", :insert),), results)
+            centralwarm = [sampling.resident[1:1]; sampling.resident[65:end]]
+            centralkeys = sampling.resident[2:64]
+            comparemaps((rawlabels..., labels...), (rawmakers..., makers...), centralwarm, centralkeys,
+                (("Generation / insertion (central leaf)", :central),), results)
+        else
+            comparemaps((rawlabels..., labels...), (rawmakers..., makers...), warm, requests,
+                (("Read", :read), ("Initial generation / insertion", :insert)), results)
+        end
         bounded = Tuple(findall(!=(:jit), selected))
         boundedlabels = map(i -> labels[i], bounded)
         boundedmakers = map(i -> makers[i], bounded)
         if storage !== :array
             comparemaps((rawlabels..., boundedlabels...), (rawmakers..., boundedmakers...), warm, requests,
                 (("Generate + evict / replace", :churn),), results)
-            if storage !== :dict
-                comparemaps(rawlabels, rawmakers, warm, requests, (("Delete", :delete),), results)
-            end
         elseif !isempty(bounded)
             comparemaps(boundedlabels, boundedmakers, warm, requests, (("Generate + evict", :churn),), results)
+        end
+        if storage in (:radixtree, :subtree)
+            centralkeys = sampling.resident[1:32]
+            outside = filter(key -> !(key in sampling.resident[1:64]), warm)
+            centralwarm = [centralkeys; outside[1:CAPACITY-32]]
+            # One batch evicts the 32 old central values, then the following requests refill it.
+            # Other columns use default batch_size=64; no noncentral victim belongs in this column.
+            centralmakers = map(bounded) do i
+                policy = selected[i]
+                policy in (:batch_reinsert, :batch_age) ?
+                    () -> SampledLRUArray{Value}(value, domain; options..., capacity=CAPACITY, policy, batch_size=32) :
+                    makers[i]
+            end
+            comparemaps((rawlabels..., boundedlabels...), (rawmakers..., centralmakers...), centralwarm, centralkeys,
+                (("Generate + evict / replace (central leaf)", :centralchurn),), results)
         end
         benchmarktable(results)
     end
 end
 
 function selections(args)
-    options = Dict{Symbol,Tuple{Vararg{Symbol}}}(:maps => (:array, :dict, :radixtree, :subtreetree), :caches => (:jit, :exact, :clock, :sieve))
+    options = Dict{Symbol,Tuple{Vararg{Symbol}}}(:maps => (:array, :dict, :radixtree, :subtree), :caches => (:jit, :exact, :sieve, :batch_reinsert, :batch_age))
     for arg in args
         parts = split(arg, '='; limit=2)
         if length(parts) != 2 || !(parts[1] in ("--maps", "--caches"))
-            error("Use --maps=array,dict,radixtree,subtreetree --caches=jit,exact,clock,sieve (default: all)")
+            error("Use --maps=array,dict,radixtree,subtree --caches=jit,exact,sieve,batch_reinsert,batch_age (default: all)")
         end
         options[Symbol(parts[1][3:end])] = Tuple(Symbol.(split(parts[2], ',')))
     end
