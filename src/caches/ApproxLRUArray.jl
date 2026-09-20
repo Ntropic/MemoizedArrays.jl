@@ -112,6 +112,14 @@ end
 @inline batchreset!(stored::BatchEntry{Bool}) = (stored.recent = false)
 @inline batchreset!(stored::BatchEntry{UInt}) = nothing
 
+@inline approxtouch!(cache, stored::BatchEntry) = batchtouch!(cache.recency, stored)
+@inline function approxtouch!(cache, stored::SieveEntry)
+    if !stored.visited
+        stored.visited = true
+    end
+    return nothing
+end
+
 function batchclean!(cache)
     state = cache.recency
     # A block bounds one pass, not total cleanup: reused entries may survive several passes.
@@ -134,13 +142,26 @@ function batchclean!(cache)
     return nothing
 end
 
+@inline function approxinsert!(cache::ApproxLRUArray{V,N,M,G,P,E}, key, value) where {V,N,M,G,P,E<:BatchEntry}
+    if cache.recency.nfree == 0
+        batchclean!(cache)
+    end
+    @inbounds stored = cache.active[cache.recency.nfree]
+    cache.recency.nfree -= 1
+    stored.key, stored.value = key, value
+    stored.recent = P === :batch_reinsert ? false : UInt(0)
+    batchappend!(cache, stored)
+    cache.count += 1
+    return stored
+end
+
 @inline function cacheget(cache::ApproxLRUArray{V,N,M,G,P,E}, key, indices=nothing) where {V,N,M,G,P,E<:BatchEntry}
     routing = cache_routing(cache, key)
     slot, hint = prepare(cache.map, key, routing)
     if slot !== nothing
         stored = preparedentry(slot, hint)
         if stored !== cache.map.empty
-            batchtouch!(cache.recency, stored)
+            approxtouch!(cache, stored)
             return stored.value
         end
     end
@@ -151,15 +172,7 @@ end
         slot = reserve!(cache.map, key, routing, slot, hint)
         store_retain!(cache.map, slot)
     end
-    if cache.recency.nfree == 0
-        batchclean!(cache)
-    end
-    @inbounds stored = cache.active[cache.recency.nfree]
-    cache.recency.nfree -= 1
-    stored.key, stored.value = key, value
-    stored.recent = P === :batch_reinsert ? false : UInt(0)
-    batchappend!(cache, stored)
-    cache.count += 1
+    stored = approxinsert!(cache, key, value)
     if !(cache.map isa TreeMap)
         slot = reserve!(cache.map, key, routing, slot, hint)
         store_retain!(cache.map, slot)
@@ -180,20 +193,7 @@ function victim!(cache::ApproxLRUArray{V,N,M,G,:sieve}) where {V,N,M,G}
     return stored
 end
 
-@inline function cacheget(cache::ApproxLRUArray{V,N,M,G,:sieve,E}, key, indices=nothing) where {V,N,M,G,E<:SieveEntry}
-    routing = cache_routing(cache, key)
-    slot, hint = prepare(cache.map, key, routing)
-    if slot !== nothing
-        stored = preparedentry(slot, hint)
-        if stored isa E
-            if !stored.visited
-                stored.visited = true
-            end
-            return stored.value
-        end
-    end
-    generated = cache.generator(generator_indices(cache, key, indices)...)
-    value = generated isa V ? generated : convert(V, generated)
+@inline function approxinsert!(cache::ApproxLRUArray{V,N,M,G,:sieve,E}, key, value) where {V,N,M,G,E<:SieveEntry}
     if cache.count == cache.capacity
         stored = victim!(cache)
         delete_entry!(cache, stored.key)
@@ -221,6 +221,22 @@ end
         cache.newest.next = stored
     end
     cache.newest = stored
+    return stored
+end
+
+@inline function cacheget(cache::ApproxLRUArray{V,N,M,G,:sieve,E}, key, indices=nothing) where {V,N,M,G,E<:SieveEntry}
+    routing = cache_routing(cache, key)
+    slot, hint = prepare(cache.map, key, routing)
+    if slot !== nothing
+        stored = preparedentry(slot, hint)
+        if stored isa E
+            approxtouch!(cache, stored)
+            return stored.value
+        end
+    end
+    generated = cache.generator(generator_indices(cache, key, indices)...)
+    value = generated isa V ? generated : convert(V, generated)
+    stored = approxinsert!(cache, key, value)
     slot = reserve!(cache.map, key, routing, slot, hint)
     store_retain!(cache.map, slot)
     slot_publish!(slot, stored)
