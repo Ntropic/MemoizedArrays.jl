@@ -1,9 +1,9 @@
 [deps]
 Documenter = "e30172f5-a6a5-5a46-863b-614d45cd2de4"
-JITArrays = "137b8a29-ca25-4068-8d2b-8b6b6dd43d69"
+MemoizedArrays = "137b8a29-ca25-4068-8d2b-8b6b6dd43d69"
 
 [sources]
-JITArrays = {path = ".."}
+MemoizedArrays = {path = ".."}
 
 [compat]
 Documenter = "1"

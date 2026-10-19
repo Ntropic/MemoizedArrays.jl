@@ -1,6 +1,15 @@
+struct ArrayMapConfig{V,D} <: MapConfig{V}
+    domain::D
+end
+
 # Array storage: fixed slots with direct reads, writes and resets.
 # Slot addresses survive eviction; capacity and recency belong to the cache.
 
+"""
+    ArrayMap{T}(domain)
+
+Dense slot storage for a finite domain. Pass the result to MemoizedArray or LRUMemoizedArray.
+"""
 struct ArrayMap{T,N}
     reference::MemoryRef{T}
     shape::NTuple{N,Int}
@@ -8,15 +17,52 @@ struct ArrayMap{T,N}
     empty::T
 end
 
+ArrayMap{V}(domain::VT) where V = ArrayMapConfig{V,typeof(Tuple(domain))}(Tuple(domain))
+
+# Fixed atomic slots share ArrayMap indexing and coordinate generation.
+# Queues own retention metadata.
+struct ConcurrentArrayMap{T,N}
+    reference::GenericMemoryRef{:atomic,T,Core.CPU}
+    shape::NTuple{N,Int}
+    strides::NTuple{N,Int}
+    empty::Empty
+end
+const DenseMap{T,N} = Union{ArrayMap{T,N},ConcurrentArrayMap{T,N}}
+const ArrayBacked{V,N} = AbstractMemoizedArray{V,N,M} where {M<:DenseMap}
+
 function ArrayMap(::Type{T}, shape, empty=EMPTY) where T
     dimensions = Tuple(shape)
     slots = empty_map(T, dimensions, empty)
     return ArrayMap{T,length(dimensions)}(memoryref(slots), dimensions, Base.size_to_strides(1, dimensions...), empty)
 end
 
-@inline slotaddress(::ArrayMap, key::Int) = key
+# Internal tree blocks have already passed block_length validation.
+function ArrayMap(::Type{T}, dimensions::NTuple{N,Int}, empty, ::Val{:nocheck}) where {T,N}
+    slots = empty_map(T, dimensions, empty, Val(false), Val(:nocheck))
+    return ArrayMap{T,N}(memoryref(slots), dimensions, Base.size_to_strides(1, dimensions...), empty)
+end
 
-@inline function slotaddress(map::ArrayMap{T,N}, key::NTuple{N,Int}) where {T,N}
+function make_cache_map(kind, ::Type{V}, config::ArrayMapConfig;
+    concurrent::Bool=false) where V
+    domain = map(axis_domain, config.domain)
+    any(isunbound, domain) && throw(ArgumentError("ArrayMap requires a finite domain"))
+    if concurrent
+        return concurrent_array_map(kind, V, map(length, domain)), domain
+    end
+    E, empty = map_entry(kind, V, Int, config)
+    return ArrayMap(E, map(length, domain), empty), domain
+end
+
+function ConcurrentArrayMap(::Type{T}, shape) where T
+    dimensions = Tuple(shape)
+    slots = empty_map(T, dimensions, EMPTY, Val(true))
+    return ConcurrentArrayMap{T,length(dimensions)}(memoryref(slots), dimensions,
+        Base.size_to_strides(1, dimensions...), EMPTY)
+end
+
+@inline slot_address(::DenseMap, key::Int) = key
+
+@inline function slot_address(map::DenseMap{T,N}, key::NTuple{N,Int}) where {T,N}
     address = N == 0 ? 1 : key[1]
     @inbounds for i in 2:N
         address += (key[i] - 1) * map.strides[i]
@@ -25,17 +71,22 @@ end
 end
 
 # Allocate and initialize slots for maps and tree blocks.
-function empty_map(::Type{T}, shape, empty=EMPTY) where T
+empty_map(::Type{T}, shape, empty=EMPTY) where T = empty_map(T, shape, empty, Val(false))
+function empty_map(::Type{T}, shape, empty, ::Val{Atomic}, ::Val{Check}=Val(:check)) where {T,Atomic,Check}
     count = 1
     for dimension in shape
-        if dimension < 0
+        if Check !== :nocheck && dimension < 0
             throw(ArgumentError("dimensions must be nonnegative"))
         end
-        count = Base.checked_mul(count, dimension)
+        count = Check === :nocheck ? count * dimension : Base.checked_mul(count, dimension)
     end
-    map = Memory{T}(undef, count)
-    for address in eachindex(map)
-        map[address] = empty
+    map = Atomic ? AtomicMemory{T}(undef, count) : Memory{T}(undef, count)
+    @inbounds for address in eachindex(map)
+        if Atomic
+            @atomic :monotonic map[address] = empty
+        else
+            map[address] = empty
+        end
     end
     return map
 end
@@ -43,13 +94,48 @@ end
 # Slot references share read/write operations with dictionary records and tree nodes.
 @inline slot_entry(slot::MemoryRef{T}) where T = @inbounds slot[]
 @inline slot_publish!(slot::MemoryRef{T}, value) where T = (@inbounds slot[] = value)
-@inline store_hash(::ArrayMap, key) = nothing
-@inline store_lookup(map::ArrayMap, key, routing) = @inbounds memoryref(map.reference, slotaddress(map, key))
-@inline store_reserve!(map::ArrayMap, key, routing) = store_lookup(map, key, routing)
-@inline prepare(map, key, routing) = (store_lookup(map, key, routing), nothing)
-@inline preparedentry(slot, hint) = slot_entry(slot)
-@inline reserve!(map::ArrayMap, key, routing, slot, hint) = slot
-store_retain!(::ArrayMap, slot) = nothing
-@inline store_delete!(map::ArrayMap, key, slot) = slot_publish!(slot, map.empty)
+@inline slot_entry(slot::GenericMemoryRef{:atomic}) = Core.memoryrefget(slot, :acquire, false)
+@inline slot_publish!(slot::GenericMemoryRef{:atomic}, value) = Core.memoryrefset!(slot, value, :release, false)
+@inline map_routing(::DenseMap, key) = nothing
+@inline map_slot(map::DenseMap, key, routing) = @inbounds memoryref(map.reference, slot_address(map, key))
+@inline map_reserve!(map::DenseMap, key, routing) = map_slot(map, key, routing)
+@inline prepare(map, key, routing) = (map_slot(map, key, routing), nothing)
+@inline prepared_entry(slot, hint) = slot_entry(slot)
+@inline reserve!(map::DenseMap, key, routing, slot, hint) = slot
+map_retain!(::DenseMap, slot) = nothing
 
-@inline delete_key!(map::ArrayMap, key) = slot_publish!(store_lookup(map, key, nothing), map.empty)
+@inline delete_key!(map::DenseMap, key) = slot_publish!(map_slot(map, key, nothing), map.empty)
+
+Base.@propagate_inbounds function cache_key(cache::ArrayBacked, key::Tuple)
+    @boundscheck checkbounds(cache, key...)
+    return slot_address(cache.map, map((i, axis) -> i - first(axis) + 1, key, axes(cache)))
+end
+
+Base.@propagate_inbounds function map_lookup(cache::ArrayBacked, indices::Tuple)
+    @boundscheck checkbounds(cache, indices...)
+    key = slot_address(cache.map, map((i, axis) -> i - first(axis) + 1, indices, axes(cache)))
+    return key, nothing, map_slot(cache.map, key, nothing), nothing
+end
+
+Base.size(cache::ArrayBacked) = cache.map.shape
+
+Base.axes(cache::ArrayBacked) = cache.domain
+
+
+function concurrent_array_map(kind, ::Type{V}, shape) where V
+    S = concurrent_value_type(V)
+    if kind === MemoizedEntry
+        return ConcurrentArrayMap(Union{Empty,Generating,GenerationFailure,S}, shape)
+    end
+    Stored = SharedLRUEntry{S,Int}
+    return ConcurrentArrayMap(Union{Empty,Generating,GenerationFailure,GenerateWait{S},Stored}, shape)
+end
+
+@inline claim_slot!(ref, expected, desired) =
+    Core.memoryrefreplace!(ref, expected, desired, :acquire_release, :acquire, false)
+
+@inline slot_exchange!(ref, stored) = Core.memoryrefswap!(ref, stored, :acquire_release, false)
+@inline slot_exchange!(ref, stored, expected) = slot_exchange!(ref, stored)
+@inline remove_mapping!(map::ConcurrentArrayMap, entry) =
+    slot_publish!(map_slot(map, (@atomic :acquire entry.key), nothing), EMPTY)
+queue_key(::ConcurrentArrayMap) = 0

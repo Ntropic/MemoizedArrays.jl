@@ -1,9 +1,9 @@
-using Documenter, JITArrays
+using Documenter, MemoizedArrays
 
 makedocs(
-    sitename="JITArrays.jl", modules=[JITArrays], checkdocs=:exports, remotes=nothing,
+    sitename="MemoizedArrays.jl", modules=[MemoizedArrays], checkdocs=:exports, remotes=nothing,
     format=Documenter.HTML(prettyurls=false, edit_link=nothing, repolink=nothing),
-    pages=["Overview" => "index.md", "API reference" => [
-        "Overview" => "api.md", "Array interface" => "api/interface.md", "Caches" => "api/caches.md", "Storage" => "api/storage.md",
+    pages=["Overview" => "index.md", "Examples" => "examples.md", "API reference" => [
+        "Overview" => "api.md", "Caches" => "api/caches.md", "Maps" => "api/maps.md", "Array interface" => "api/interface.md",
     ], "Benchmarks" => "benchmarks.md"],
 )

@@ -1,38 +1,80 @@
 <!doctype html>
 <html lang="en">
 <meta charset="utf-8">
-<title>JITArrays cache and storage choices</title>
+<title>MemoizedArrays cache and map choices</title>
 <style>
-    body { margin: 0; }
+    :root { --diagram-text: #222; --diagram-link: #2e63b8; }
+    @media (prefers-color-scheme: dark) {
+        :root { --diagram-text: #fff; --diagram-link: #1abc9c; }
+    }
+    html, body { margin: 0; background: transparent !important; overflow: hidden; }
     .mermaid { text-align: center; }
+    .mermaidTooltip:empty { display: none; }
+    .mermaid svg { display: block; width: 100%; height: auto; margin: auto; background: transparent !important; }
+    .mermaid .node rect {
+        fill: color-mix(in srgb, var(--diagram-text) 8%, transparent) !important;
+        stroke: var(--diagram-text) !important;
+    }
+    .mermaid .flowchart-link { stroke: var(--diagram-text) !important; }
+    .mermaid .marker { fill: var(--diagram-text) !important; stroke: var(--diagram-text) !important; }
     .mermaid a { cursor: pointer; }
     .mermaid a foreignObject { pointer-events: none; }
-    .mermaid a .nodeLabel { color: #0969da !important; text-decoration: underline; }
+    .mermaid a .nodeLabel { color: var(--diagram-link) !important; text-decoration: underline; }
 </style>
 <div class="mermaid">
 flowchart LR
-    A["JITArrays"] --> C["Cache"]
-    A --> S["Storage"]
-    C --> U["Unbounded · JITArray"]
-    C --> B["Bounded · LRUArray"]
-    S --> D["Array"]
-    S --> H["Dictionary"]
-    S --> M["radix tree · high bits first"]
-    S --> L["subtree radix tree · shortcuts by depth"]
-    click A "../api.html" "API reference" _parent
-    click C "../api/caches.html" "Cache choices" _parent
-    click S "../api/storage.html" "Storage choices" _parent
-    click U "../api/caches.html#unbounded" "Keep generated values" _parent
-    click B "../api/caches.html#bounded" "Limit resident values" _parent
-    click D "../api/storage.html#array" "Fixed integer shape" _parent
-    click H "../api/storage.html#dictionary" "Sparse coordinate lookup" _parent
-    click M "../api/storage.html#radix-tree" "MSB = most significant bit: highest binary place values first" _parent
-    click L "../api/storage.html#subtree-radix-tree" "Shared radix tree with shortcuts selected by coordinate bit depth" _parent
+    A["MemoizedArrays"] --> C["Cache"]
+    A --> S["Map"]
+    C --> U["MemoizedArray · without eviction"]
+    C --> B["Bounded · LRUMemoizedArray"]
+    S --> D["ArrayMap"]
+    S --> E["ExpandingArrayMap"]
+    S --> M["RadixMap"]
+    S --> L["SubtreeRadixMap"]
+    S --> H["DictMap"]
+    click A "../index.html" "Overview" _parent
+    click C "../examples.html" "Cache choices" _parent
+    click S "../examples.html" "Map choices" _parent
+    click U "../examples.html#MemoizedArray" "Keep generated values" _parent
+    click B "../examples.html#LRUMemoizedArray" "Limit resident values" _parent
+    click D "../examples.html#ArrayMap" "Fixed integer shape" _parent
+    click E "../examples.html#ExpandingArrayMap" "Grow above upper bounds" _parent
+    click H "../examples.html#DictMap" "Sparse coordinate lookup" _parent
+    click M "../examples.html#RadixMap" "MSB = most significant bit: highest binary place values first" _parent
+    click L "../examples.html#SubtreeRadixMap" "Shared radix tree with shortcuts selected by coordinate bit depth" _parent
 </div>
 <script type="module">
     import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+    // The iframe does not inherit Documenter's colors. Follow its actual palette,
+    // including custom themes and live changes through the settings menu.
+    try {
+        const page = parent.document.querySelector("#documenter-page");
+        if (page) {
+            const syncTheme = () => {
+                const style = document.documentElement.style;
+                style.setProperty("--diagram-text", parent.getComputedStyle(page).color);
+                const link = page.querySelector("p a, li a") || page;
+                style.setProperty("--diagram-link", parent.getComputedStyle(link).color);
+            };
+            syncTheme();
+            new MutationObserver(syncTheme).observe(parent.document.documentElement,
+                {attributes: true, attributeFilter: ["class"]});
+            page.addEventListener("transitionend", syncTheme);
+        }
+    } catch (error) {
+        // Standalone or cross-origin previews use the system light/dark palette.
+        if (error.name !== "SecurityError") throw error;
+    }
     mermaid.initialize({startOnLoad: false, securityLevel: "loose", theme: "neutral",
         flowchart: {nodeSpacing: 16, rankSpacing: 30}});
     await mermaid.run({querySelector: ".mermaid"});
+    const diagram = document.querySelector(".mermaid");
+    const fitFrame = () => {
+        if (window.frameElement) {
+            window.frameElement.style.height = `${Math.ceil(diagram.getBoundingClientRect().height)}px`;
+        }
+    };
+    fitFrame();
+    new ResizeObserver(fitFrame).observe(diagram);
 </script>
 </html>

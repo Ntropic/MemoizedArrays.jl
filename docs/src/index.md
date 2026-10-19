@@ -1,68 +1,51 @@
-# JITArrays.jl
+# MemoizedArrays.jl
 
-**Generate on demand. Reuse through ordinary array indexing.**
+```@meta
+DocTestSetup = :(using MemoizedArrays)
+```
 
-JITArrays caches expensive, index-dependent computations in memory: scalars, matrices, or other Julia
-objects. Generation is synchronous; reading a cached entry allocates no memory.
-This version has no concurrency handling and does not support concurrent access to the same cache.
-Keep every generated value, or set a capacity and let the cache evict old entries.
+**Compute array elements when you need them, and reuse the results.**
 
-Use standard indexing, slices, and lazy views, with synchronous generation for batches.
-Array storage suits fixed shapes; sparse storage supports huge signed coordinate domains without
-allocating every position. Requires Julia 1.12 or later.
+- Avoid repeating expensive computations.
+- Generate only the coordinates you access.
+- Limit memory usage via LRU eviction.
+- Concurrently access and generate values.
 
-## Choose cache and storage
+## Install
 
-Choose these independently: **unbounded** or **bounded** caching, with any of the four storage backends.
-Bounded caches offer approximate eviction (default) or exact LRU. Click a diagram node for its API page.
+Install from source via
+
+```julia
+using Pkg
+Pkg.add(url="https://github.com/Ntropic/MemoizedArrays.jl")
+```
+
+## Core idea
+
+Each array combines three components:
+- **Generator** the function or closure connecting the indexes of an array to their desired values.
+- **Map:** coordinate lookup and storage.
+- **Cache:** manages the generation and eviction of values.
+
+Choose one of each below.
 
 ```@raw html
-<iframe src="assets/overview.html" title="Cache and storage choices"
-    style="width: 100%; height: 440px; border: 0;"></iframe>
+<iframe src="assets/overview.html" title="Cache and map choices"
+    style="display: block; width: 100%; border: 0; background: transparent;"></iframe>
 ```
 
-## A few examples
+## Basic usage
 
-### Compute once, read again
+```julia
+using MemoizedArrays
 
-```jldoctest
-julia> using JITArrays
+value_at(i, j) = sin(i) * cos(j)
+values = MemoizedArray(value_at, ArrayMap{Float64}((100, 100)))
 
-julia> a = JITArray{Matrix{Float64}}((i, j) -> fill(Float64(i + j), 2, 2), 3, 4);
-
-julia> a[2, 3] == fill(5.0, 2, 2)
-true
-
-julia> a[8] === a[2, 3]
-true
+values[2, 3]  # Compute on first access.
+values[2, 3]  # Reuses the stored result.
 ```
 
-### Bound the number of resident values
+The map (`ArrayMap`) specifies the type of value type, array type and size; the cache (`MemoizedArray`) controls generation of values, their retention and concurrency.
 
-```jldoctest
-julia> using JITArrays
-
-julia> a = LRUArray{Int}(identity, 10; capacity=2, policy=:exact);
-
-julia> a[1], a[2], a[1], a[3]
-(1, 2, 1, 3)
-
-julia> isready(a, 2)
-false
-```
-
-### Generate a batch of sparse coordinates
-
-```jldoctest
-julia> using JITArrays
-
-julia> a = JITArray{Tuple{Int,Int}}(tuple, typemin(Int):typemax(Int), -100:100);
-
-julia> generate!(a, ((-20, 3), (50, -1))) === a
-true
-
-julia> a[-20, 3]
-(-20, 3)
-```
-
-Continue with the [API reference](api.md) for indexing, views, generation, cache policies, and storage choices.
+See [Examples](examples.md) for other cache and map combinations and functionalities. The [API reference](api.md) documents constructors, domains and array operations.

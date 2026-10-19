@@ -1,427 +1,439 @@
-# Compare synchronous storage and cache operations with one timed loop.
-# Setup, prefill, round-boundary GC and validation are outside timing.
-using JITArrays
-using Random
-using LinearAlgebra
-using Statistics
+# Public cache benchmarks; preconfigured matrices and scalar checksum.
+# Run with julia --project=. -t 8 benchmark.jl; set QUEUE_READ_PATTERN=varying for random repeats.
+# Optional Linux affinity: QUEUE_PIN=true QUEUE_CPU_OFFSET=8 QUEUE_PRODUCER_CPU=0.
+# Optional expanding LRU cases: QUEUE_CASES=expanding-lru-serial,expanding-lru.
+# Optional Dict cases: QUEUE_CASES=dict-serial,dict,dict-lru-serial,dict-lru.
+# Tree Memoized cases: array2d-serial,array2d,radix-serial,radix,subtree-serial,subtree.
+# Tree LRU cases: append -lru before the optional -serial suffix.
+# Tree operations: read-central,read-spread,generate-central,generate-existing,generate-structural.
+# Tree LRU also supports evict-central and evict-spread.
+using MemoizedArrays, Random, Statistics
+const payload = ones(4, 4)
+const rounds = parse(Int, get(ENV, "QUEUE_ROUNDS", "15"))
+const readrepeats = parse(Int, get(ENV, "QUEUE_READ_REPEATS", "512"))
+const readpattern = get(ENV,"QUEUE_READ_PATTERN","cycle")
+const operations = Tuple(Symbol.(split(get(ENV, "QUEUE_OPERATIONS", "read,generate,evict"), ',')))
+const workers = Threads.nthreads()
+const cpu_offset = parse(Int,get(ENV,"QUEUE_CPU_OFFSET","0"))
+const treecases = ("array2d-serial", "array2d", "radix-serial", "radix", "subtree-serial", "subtree",
+    "array2d-lru-serial", "array2d-lru", "radix-lru-serial", "radix-lru", "subtree-lru-serial", "subtree-lru")
+const treeoperations = Tuple(Symbol.(("read-central", "read-spread", "generate-central", "generate-existing", "generate-structural", "evict-central", "evict-spread")))
 
-const Value = Matrix{Float64}
-const CAPACITY = 512
-const ROUNDS = 15
-const GENERATION_CACHES = 8
-const PRECOMPUTED_VALUE = fill(1.0, 4, 4)
-@inline value(keys...) = PRECOMPUTED_VALUE
-@inline readvalue(cache, key::Int) = @inbounds cache[key]
-@inline readvalue(cache, key::Tuple) = @inbounds cache[key...]
-@inline replacement(key::Int) = key + CAPACITY
-@inline replacement(key::Tuple) = (key[1] + 128, Base.tail(key)...)
-@inline replacement(key, ::Val{:churn}) = replacement(key)
-@inline replacement(key::Tuple, ::Val{:centralchurn}) = (key[1] + 4, Base.tail(key)...)
-
-@inline mapread(map, key) = get(map, key, nothing)
-@inline mapread(cache::AbstractJITArray, key) = readvalue(cache, key)
-@inline function mapread(map::JITArrays.SparseMap, key)
-    slot = JITArrays.store_lookup(map, key, JITArrays.store_hash(map, key))
-    return slot === nothing ? nothing : JITArrays.slot_entry(slot)
-end
-@inline mapinsert!(map, key) = (map[key] = PRECOMPUTED_VALUE)
-@inline mapinsert!(cache::AbstractJITArray, key) = readvalue(cache, key)
-@inline function mapinsert!(map::JITArrays.SparseMap, key)
-    slot = JITArrays.store_reserve!(map, key, JITArrays.store_hash(map, key))
-    JITArrays.store_retain!(map, slot)
-    return JITArrays.slot_publish!(slot, PRECOMPUTED_VALUE)
-end
-
-@inline mapdelete!(map, key) = delete!(map, key)
-@inline mapdelete!(map::JITArrays.SparseMap, key) = JITArrays.delete_key!(map, key)
-mapsizehint!(map::Dict) = sizehint!(map, CAPACITY)
-mapsizehint!(map::JITArrays.DictMap) = JITArrays.hash_rebuild!(map, 2CAPACITY)
-
-@inline operation!(map, key, ::Val{:read}) = mapread(map, key)
-@inline operation!(map, key, ::Val{:insert}) = mapinsert!(map, key)
-@inline operation!(map, key, ::Val{:central}) = mapinsert!(map, key)
-@inline function operation!(map, key, operation::Union{Val{:churn},Val{:centralchurn}})
-    mapdelete!(map, key)
-    return mapinsert!(map, replacement(key, operation))
-end
-@inline operation!(cache::AbstractJITArray, key, operation::Union{Val{:churn},Val{:centralchurn}}) =
-    readvalue(cache, replacement(key, operation))
-@inline function operation!(map, key, ::Val{:threshold})
-    mapdelete!(map, key)
-    return mapinsert!(map, key)
-end
-@inline operation!(map, key, ::Val{:reserved}) = mapinsert!(map, key)
-
-# Consume one matrix element per request without writing an output array.
-function mapoperations!(maps, keys, operation)
+@inline function consume(reader::R, keys::K, repeats) where {R,K}
     checksum = 0.0
-    for map in maps, key in keys
-        result = operation!(map, key, operation)
-        checksum += @inbounds result[1, 1]
+    for _ in 1:repeats, key in keys
+        checksum += @inbounds reader[key][1,1]
     end
     return checksum
 end
-
-function measured(maps, keys, operation)
-    sample = @timed mapoperations!(maps, keys, operation)
-    requests = length(maps) * length(keys)
-    @assert sample.value == requests
-    return (sample.time * 1e9 / requests, sample.bytes / requests, sample.gctime * 1e9 / requests)
+struct Job{R,K,P}
+    reader::R
+    keys::K
+    repeats::Int
+    warm::Bool
+    prepare::P
+    deadline::Base.RefValue{UInt64}
+    ready::Channel{Nothing}
+    start::Base.Event
+end
+function run_job(job::Job)
+    job.prepare()
+    if job.warm
+        consume(job.reader, job.keys, 1)
+    end
+    put!(job.ready, nothing)
+    wait(job.start)
+    while time_ns() < job.deadline[]
+        GC.safepoint()
+    end
+    begin_ns = time_ns()
+    checksum = consume(job.reader, job.keys, job.repeats)
+    end_ns = time_ns()
+    return (begin_ns, end_ns, checksum)
 end
 
-formattime(ns) = ns < 1000 ? string(round(ns; digits=1), " ns") : string(round(ns / 1000; digits=1), " µs")
-
-function benchmarktable(results)
-    println("\nMedian time per operation.")
-    names = unique(first.(results))
-    workloads = unique(getindex.(results, 2))
-    println("\n| Implementation | ", join(workloads, " | "), " |")
-    println("|---|", join(fill("---:", length(workloads)), "|"), "|")
-    for name in names
-        timings = Dict((r[2], r[3]) for r in results if r[1] == name)
-        values = [haskey(timings, workload) ? formattime(timings[workload]) : "—" for workload in workloads]
-        println("| ", name, " | ", join(values, " | "), " |")
-    end
-end
-
-hasvalue(cache::AbstractJITArray, key) = isready(cache, key)
-hasvalue(map, key) = mapread(map, key) === PRECOMPUTED_VALUE
-
-benchmarkleaf(cache::AbstractJITArray, key) = benchmarkleaf(cache.map, key)
-benchmarkleaf(map::JITArrays.TreeMap, key) =
-    JITArrays.store_lookup(map, key, JITArrays.store_hash(map, key)).leaf
-
-function comparemaps(names, makers, warmkeys, requestkeys, operations, results=Tuple{String,String,Float64}[])
-    for (label, operation) in operations
-        residents = operation === :threshold ? 48 : operation === :central ? length(warmkeys) : CAPACITY
-        keys = operation in (:read, :central, :centralchurn) ? requestkeys : operation === :threshold ?
-            [warmkeys[mod(i - 1, residents) + 1] for i in 1:CAPACITY] : warmkeys
-        replacing = operation in (:churn, :centralchurn)
-        checked = replacing ? replacement.(keys, Ref(Val(operation))) :
-            operation === :central ? requestkeys : view(warmkeys, 1:residents)
-        function setup(make)
-            maps = [make() for _ in 1:GENERATION_CACHES]
-            for map in maps
-                if operation === :reserved
-                    mapsizehint!(map)
-                elseif operation in (:read, :churn, :centralchurn, :threshold, :central)
-                    for i in 1:residents
-                        mapinsert!(map, warmkeys[i])
-                    end
-                end
-            end
-            return maps
-        end
-        samples = [NTuple{3,Float64}[] for _ in makers]
-        for make in makers
-            measured(setup(make), keys, Val(operation))
-        end
-        batches = operation === :central ? 8 : operation === :centralchurn ? 16 : 1
-        if operation === :central
-            @assert length(unique(keys)) == length(keys)
-        end
-        if operation === :centralchurn
-            @assert length(unique(warmkeys)) == CAPACITY
-            @assert length(unique(checked)) == length(keys) == 32
-            @assert keys == warmkeys[1:32]
-            @assert isempty(intersect(warmkeys, checked))
-            inner = -Int(JITArrays.tree_offset((8,8), true)[1] & UInt(7))
-            @assert all(key -> all(axis -> inner <= axis < inner + 8, key), [keys; checked])
-        end
-        for round in 1:ROUNDS
-            GC.gc()
-            for i in circshift(collect(eachindex(makers)), round)
-                total = (0.0, 0.0, 0.0)
-                for batch in 1:batches
-                    maps = setup(makers[i])
-                    central = operation in (:central, :centralchurn) ? [benchmarkleaf(map, first(warmkeys)) for map in maps] : nothing
-                    if operation in (:central, :centralchurn)
-                        missing = operation === :central ? keys : checked
-                        @assert all(map -> all(key -> !hasvalue(map, key), missing), maps)
-                    end
-                    total = Base.map(+, total, measured(maps, keys, Val(operation)))
-                    for (j, map) in enumerate(maps)
-                        if operation === :central
-                            @assert all(key -> benchmarkleaf(map, key) === central[j], keys)
-                            @assert all(key -> hasvalue(map, key), warmkeys)
-                            @assert !(map isa AbstractJITArray) || map isa JITArray || map.count == residents + length(keys)
-                        end
-                        if operation === :centralchurn
-                            @assert all(key -> benchmarkleaf(map, key) === central[j], checked)
-                            @assert all(key -> !hasvalue(map, key), keys)
-                            @assert all(key -> hasvalue(map, key), checked)
-                            @assert all(key -> hasvalue(map, key), warmkeys[33:end])
-                        end
-                        if map isa AbstractDict
-                            @assert length(map) == residents
-                        elseif map isa JITArrays.DictMap
-                            @assert map.count == residents
-                        end
-                        if !(replacing && map isa AbstractJITArray)
-                            @assert all(key -> hasvalue(map, key), checked)
-                        end
-                        if replacing && !(map isa AbstractJITArray)
-                            @assert all(key -> !hasvalue(map, key), keys)
-                        elseif replacing
-                            @assert count(key -> hasvalue(map, key), [warmkeys; checked]) == map.count <= residents
-                        end
-                    end
-                end
-                push!(samples[i], Base.map(value -> value / batches, total))
-            end
-        end
-        for i in eachindex(makers)
-            push!(results, (names[i], label, median(first.(samples[i]))))
+# Bring existing empty slots and preallocated LRU memory onto the requesting core.
+# Dict records are allocated during timed generation; setup does not reserve keys.
+function touch_empty!(reader,keys)
+    cache = reader isa MemoizedArrays.QueueHandle ? reader.cache : reader
+    JA = MemoizedArrays
+    if !(cache.map isa Union{JA.DictMap,JA.LRUDictMap,JA.ConcurrentDictMap})
+        for key in keys
+            ref = JA.map_slot(cache.map,JA.cache_key(cache,(key,)),nothing)
+            @assert JA.slot_entry(ref) === cache.map.empty
+            JA.slot_publish!(ref,cache.map.empty)
         end
     end
-    return results
-end
-
-# Optional external comparison: using DataStructures; comparetrees(SortedDict, Trie).
-function comparetrees(SortedDict, Trie; maps=(:radixtree, :subtree))
-    @assert !isempty(maps) && all(m -> m in (:radixtree, :subtree), maps) "Trees: radixtree, subtree"
-    println("Julia ", VERSION, "; DataStructures ", pkgversion(parentmodule(SortedDict)), "; ", ROUNDS, " interleaved rounds.")
-    domain = (typemin(Int):typemax(Int), typemin(Int):typemax(Int))
-    constructors = (radixtree=JITArrays.RadixMap, subtree=JITArrays.SubtreeRadixMap)
-    selected = Tuple(unique(maps))
-    trees = map(selected) do storage
-        Map = constructors[storage]
-        () -> Map(Union{JITArrays.Empty,Value}, domain, (8, 8), JITArrays.EMPTY)
+    if reader isa MemoizedArrays.QueueHandle
+        q = reader.queue
+        resetkey = zero.(JA.cache_key(cache,(1,)))
+        @assert q.count == 0
+        fill!(q.positions.mem,0)
+        fill!(q.incarnations.mem,0)
+        for i in 1:q.capacity
+            entry=q.pool[i]
+            @atomic :monotonic entry.state=UInt64(2)
+            @atomic :monotonic entry.last_access=UInt64(0)
+            @atomic :monotonic entry.key=resetkey
+            @atomic :monotonic entry.value=JA.EMPTY
+            q.free[i]=entry
+            q.pool[i]=entry
+            q.entries[i]=entry
+            q.links.mem[2i-1]=0
+            q.links.mem[2i]=UInt32(i==q.capacity ? 0 : i+1)
+        end
+        q.count=0
+        q.oldest=q.newest=UInt32(0)
+        q.vacant=UInt32(1)
+        q.free_count=q.capacity
+    elseif reader isa LRUMemoizedArray
+        q = reader.eviction
+        resetkey = zero.(JA.cache_key(cache,(1,)))
+        Key = fieldtype(eltype(q.entries),:key)
+        if Key <: JA.DictLocation
+            resetkey = Key(resetkey,hash(resetkey),0)
+        end
+        @assert q.count == 0
+        for i in 1:q.capacity
+            entry=q.entries[i]
+            entry.key=resetkey
+            entry.value=payload
+            q.entries[i]=entry
+        end
+        fill!(q.links.mem,0)
+        q.oldest=q.newest=UInt32(0)
+        q.count=0
     end
-    makers = (trees..., () -> SortedDict{NTuple{2,Int},Value}(), () -> Dict{NTuple{2,Int},Value}(), () -> Trie{Int,Value}())
-    names = (map(storage -> string(nameof(constructors[storage])), selected)..., "SortedDict", "Dict", "Trie")
-    rng = Xoshiro(2026)
-    nearby = [(2mod(i, 32), 2div(i, 32)) for i in 1:CAPACITY]
-    scattered = [(rand(rng, Int), rand(rng, Int)) for _ in 1:CAPACITY]
-    mixed = [nearby[1:end-16]; scattered[1:16]]
-    for (label, warm) in (("Nearby keys", nearby), ("Scattered signed keys", scattered),
-        ("Mostly nearby keys, 16 large outliers", mixed))
-        @assert length(unique(warm)) == CAPACITY
-        @assert isempty(intersect(warm, [(key[1] + 128, key[2]) for key in warm]))
-        if warm === mixed
-            requests = [mod(i, 100) == 0 ? warm[CAPACITY - 15 + mod(div(i, 100), 16)] :
-                warm[mod(i * 73, CAPACITY - 16) + 1] for i in 1:32768]
-        else
-            requests = [warm[mod(i * 73, CAPACITY) + 1] for i in 1:32768]
-        end
-        println("\n### ", label)
-        results = Tuple{String,String,Float64}[]
-        comparemaps(names, makers, warm, requests, (("Lookup", :read), ("Insert", :insert)), results)
-        # DataStructures.Trie has no deletion operation.
-        comparemaps(names[1:end-1], makers[1:end-1], warm, requests, (("Replace", :churn),), results)
-        benchmarktable(results)
-    end
-end
-
-tree_generation_keys() = [(2mod(i,32)-3, 2div(i,32)-3) for i in 0:CAPACITY-1]
-
-function tree_read_samples()
-    rng = Xoshiro(2026)
-    offset = JITArrays.tree_offset((8,8), true)[1]
-    bounds = [(-Int(offset & UInt(8^depth-1)), 8^depth) for depth in 1:4]
-    inner, size = first(bounds)
-    resident = [(x,y) for x in inner:inner+size-1 for y in inner:inner+size-1]
-    lower, width = last(bounds)
-    while length(resident) < CAPACITY
-        key = (rand(rng,lower:lower+width-1), rand(rng,lower:lower+width-1))
-        if !(key in resident)
-            push!(resident,key)
-        end
-    end
-    bands = [1:64,65:CAPACITY]
-    # Two extremes: widely scattered resident keys, or only the central leaf.
-    uniform = [resident[65+mod(i, CAPACITY-64)] for i in 0:32767]
-    shuffle!(rng,uniform)
-    clustered = repeat(resident[1:64],512)
-    shuffle!(rng,clustered)
-    @assert length(resident) == length(unique(resident)) == CAPACITY
-    @assert length(uniform) == length(clustered) == 32768
-    @assert all(key -> all(i -> inner <= i < inner+size,key),clustered)
-    @assert all(key -> !all(i -> inner <= i < inner+size,key),uniform)
-    return (; resident,uniform,clustered,bounds,bands)
-end
-
-function benchmark(; maps=(:array, :dict, :radixtree, :subtree), caches=(:jit, :exact, :sieve, :batch_reinsert, :batch_age))
-    @assert !isempty(maps) && all(m -> m in (:array, :dict, :radixtree, :subtree), maps) "Maps: array, dict, radixtree, subtree"
-    @assert !isempty(caches) && all(c -> c in (:jit, :exact, :sieve, :batch_reinsert, :batch_age), caches) "Caches: jit, exact, sieve, batch_reinsert, batch_age"
-    println("Julia ", VERSION, "; ", ROUNDS, " rotated rounds; ", GENERATION_CACHES, " containers per sample.")
-    println("One timed loop, one matrix-element checksum/request; no output-array writes. Setup and prefill are untimed; full GC precedes each round. GC during operations is included.")
-    println("Insertion/cache miss stores one precomputed matrix. Ready reads and misses use the same loop.")
-    for storage in unique(maps)
-        shape = storage in (:radixtree, :subtree) ? (8, 8) : nothing
-        domain = storage === :array ? (4096,) : (typemin(Int):typemax(Int), typemin(Int):typemax(Int))
-        options = (; storage=storage === :array ? nothing : storage, block_shape=shape)
-        constructors = (jit=JITArray{Value}, exact=ExactLRUArray{Value}, sieve=ApproxLRUArray{Value},
-            batch_reinsert=ApproxLRUArray{Value}, batch_age=ApproxLRUArray{Value})
-        names = (jit="JITArray", exact="ExactLRUArray", sieve="ApproxLRUArray (:sieve)",
-            batch_reinsert="ApproxLRUArray (:batch_reinsert)", batch_age="ApproxLRUArray (:batch_age)")
-        selected = Tuple(unique(caches))
-        makers = map(selected) do policy
-            constructor = constructors[policy]
-            settings = policy === :jit ? options : policy === :exact ? (; options..., capacity=CAPACITY) : (; options..., capacity=CAPACITY, policy)
-            () -> constructor(value, domain; settings...)
-        end
-        labels = map(policy -> names[policy], selected)
-        warm = storage === :array ? collect(1:CAPACITY) : [(2mod(i, 32), 2div(i, 32)) for i in 1:CAPACITY]
-        if storage in (:radixtree, :subtree)
-            # Sixteen residents per leaf for initial population and ordinary replacement.
-            warm = tree_generation_keys()
-        end
-        requests = [warm[mod(i * 73, CAPACITY) + 1] for i in 1:32768]
-        if storage === :array
-            rawlabels, rawmakers = ("Array",), (() -> Vector{Value}(undef, 4096),)
-        elseif storage === :dict
-            rawlabels = ("Dict",)
-            rawmakers = (() -> Dict{NTuple{2,Int},Value}(),)
-        else
-            Map = storage === :radixtree ? JITArrays.RadixMap : JITArrays.SubtreeRadixMap
-            rawlabels = (string(nameof(Map)),)
-            rawmakers = (() -> Map(Union{JITArrays.Empty,Value}, domain, shape, JITArrays.EMPTY),)
-        end
-        println("\n## ", storage)
-        results = Tuple{String,String,Float64}[]
-        if storage in (:radixtree, :subtree)
-            sampling = tree_read_samples()
-            comparemaps((rawlabels..., labels...), (rawmakers..., makers...), sampling.resident, sampling.uniform,
-                (("Read (spread out)", :read),), results)
-            comparemaps((rawlabels..., labels...), (rawmakers..., makers...), sampling.resident, sampling.clustered,
-                (("Read (central leaf)", :read),), results)
-            comparemaps((rawlabels..., labels...), (rawmakers..., makers...), warm, requests,
-                (("Initial generation / insertion", :insert),), results)
-            centralwarm = [sampling.resident[1:1]; sampling.resident[65:end]]
-            centralkeys = sampling.resident[2:64]
-            comparemaps((rawlabels..., labels...), (rawmakers..., makers...), centralwarm, centralkeys,
-                (("Generation / insertion (central leaf)", :central),), results)
-        else
-            comparemaps((rawlabels..., labels...), (rawmakers..., makers...), warm, requests,
-                (("Read", :read), ("Initial generation / insertion", :insert)), results)
-        end
-        bounded = Tuple(findall(!=(:jit), selected))
-        boundedlabels = map(i -> labels[i], bounded)
-        boundedmakers = map(i -> makers[i], bounded)
-        if storage !== :array
-            comparemaps((rawlabels..., boundedlabels...), (rawmakers..., boundedmakers...), warm, requests,
-                (("Generate + evict / replace", :churn),), results)
-        elseif !isempty(bounded)
-            comparemaps(boundedlabels, boundedmakers, warm, requests, (("Generate + evict", :churn),), results)
-        end
-        if storage in (:radixtree, :subtree)
-            centralkeys = sampling.resident[1:32]
-            outside = filter(key -> !(key in sampling.resident[1:64]), warm)
-            centralwarm = [centralkeys; outside[1:CAPACITY-32]]
-            # One batch evicts the 32 old central values, then the following requests refill it.
-            # Other columns use default batch_size=64; no noncentral victim belongs in this column.
-            centralmakers = map(bounded) do i
-                policy = selected[i]
-                policy in (:batch_reinsert, :batch_age) ?
-                    () -> ApproxLRUArray{Value}(value, domain; options..., capacity=CAPACITY, policy, batch_size=32) :
-                    makers[i]
-            end
-            comparemaps((rawlabels..., boundedlabels...), (rawmakers..., centralmakers...), centralwarm, centralkeys,
-                (("Generate + evict / replace (central leaf)", :centralchurn),), results)
-        end
-        benchmarktable(results)
-    end
-end
-
-function selections(args)
-    options = Dict{Symbol,Tuple{Vararg{Symbol}}}(:maps => (:array, :dict, :radixtree, :subtree), :caches => (:jit, :exact, :sieve, :batch_reinsert, :batch_age))
-    for arg in args
-        parts = split(arg, '='; limit=2)
-        if length(parts) != 2 || !(parts[1] in ("--maps", "--caches"))
-            error("Use --maps=array,dict,radixtree,subtree --caches=jit,exact,sieve,batch_reinsert,batch_age (default: all)")
-        end
-        options[Symbol(parts[1][3:end])] = Tuple(Symbol.(split(parts[2], ',')))
-    end
-    return (; options...)
-end
-
-# LAPACK DSYEVR, matching Julia's default symmetric eigensolver, with caller-owned buffers.
-function matrixeigh!(W, eigenvalues, eigenvectors, support, work, iwork, found, info; query=false)
-    n = size(W, 1)
-    lwork, liwork = query ? (-1, -1) : (length(work), length(iwork))
-    ccall((LinearAlgebra.BLAS.@blasfunc(dsyevr_), LinearAlgebra.LAPACK.libblastrampoline), Cvoid,
-        (Ref{UInt8}, Ref{UInt8}, Ref{UInt8}, Ref{LinearAlgebra.BlasInt},
-         Ptr{Float64}, Ref{LinearAlgebra.BlasInt}, Ref{Float64}, Ref{Float64},
-         Ref{LinearAlgebra.BlasInt}, Ref{LinearAlgebra.BlasInt}, Ref{Float64}, Ptr{LinearAlgebra.BlasInt},
-         Ptr{Float64}, Ptr{Float64}, Ref{LinearAlgebra.BlasInt}, Ptr{LinearAlgebra.BlasInt},
-         Ptr{Float64}, Ref{LinearAlgebra.BlasInt}, Ptr{LinearAlgebra.BlasInt}, Ref{LinearAlgebra.BlasInt},
-         Ref{LinearAlgebra.BlasInt}, Clong, Clong, Clong),
-        'V', 'A', 'U', n, W, stride(W, 2), 0.0, 0.0, 0, 0, -1.0, found,
-        eigenvalues, eigenvectors, stride(eigenvectors, 2), support, work, lwork, iwork, liwork, info, 1, 1, 1)
-    LinearAlgebra.LAPACK.chklapackerror(info[])
     return nothing
 end
 
-function matrixoperations!(inputs, C, W, eigenvalues, eigenvectors, support, work, iwork, found, info, ::Val{operation}) where operation
-    checksum = 0.0
-    for i in 1:4096
-        A, B = @inbounds inputs[mod1(i, length(inputs))]
-        if operation === :addition
-            C .= A .+ B
-            checksum += @inbounds C[1]
-        elseif operation === :product
-            mul!(C, A, B)
-            checksum += @inbounds C[1]
-        else
-            copyto!(W, A)
-            matrixeigh!(W, eigenvalues, eigenvectors, support, work, iwork, found, info)
-            checksum += @inbounds eigenvalues[1]
-        end
-    end
-    return checksum
+function makecase(name, callers, capacity, domain)
+    base = replace(name, r"-serial$" => "")
+    base in ("memoized", "lru", "expanding", "expanding-lru", "dict", "dict-lru") ||
+        name in treecases || throw(ArgumentError("unknown case $name"))
+    config = startswith(name, "dict") ? DictMap{Matrix{Float64}}(domain) :
+        startswith(name, "expanding") ? ExpandingArrayMap{Matrix{Float64}}(domain; increment=8) :
+        startswith(name, "radix") ? RadixMap{Matrix{Float64}}(domain; block_shape=(8, 8)) :
+        startswith(name, "subtree") ? SubtreeRadixMap{Matrix{Float64}}(domain; block_shape=(8, 8)) : ArrayMap{Matrix{Float64}}(domain)
+    concurrent = !endswith(name, "serial")
+    bounded = occursin("lru", name)
+    cache = bounded ?
+        LRUMemoizedArray(Returns(payload), config; capacity, concurrent, queues=callers) :
+        MemoizedArray(Returns(payload), config; concurrent)
+    readers = bounded && concurrent ? [queue_handle(cache, w) for w in 1:callers] : fill(cache, callers)
+    return cache, readers
 end
 
-"""Benchmark supplied-output matrix operations at powers of two from 2 through `maxsize` (default 16)."""
-function benchmarkmatrices(maxsize::Int=16)
-    maxsize >= 2 || throw(ArgumentError("maximum matrix size must be at least 2"))
-    BLAS.set_num_threads(1)
-    println("\n## Matrix operations with supplied outputs")
-    println("\n| Size | Addition | Multiplication | eigh |")
-    println("|---|---:|---:|---:|")
-    rng = Xoshiro(2026)
-    for power in 1:floor(Int, log2(maxsize))
-        n = 2^power
-        inputs = [(randn(rng, n, n), randn(rng, n, n)) for _ in 1:64]
-        C, W, eigenvalues, eigenvectors = zeros(n,n), zeros(n,n), zeros(n), zeros(n,n)
-        support = Vector{LinearAlgebra.BlasInt}(undef, 2n)
-        work, iwork = zeros(1), zeros(LinearAlgebra.BlasInt, 1)
-        found, info = Ref{LinearAlgebra.BlasInt}(0), Ref{LinearAlgebra.BlasInt}(0)
-        matrixeigh!(W, eigenvalues, eigenvectors, support, work, iwork, found, info; query=true)
-        resize!(work, Int(work[1]))
-        resize!(iwork, Int(iwork[1]))
-        buffers = (inputs, C, W, eigenvalues, eigenvectors, support, work, iwork, found, info)
-        operations = (Val(:addition), Val(:product), Val(:eigh))
-        samples = [Float64[] for _ in operations]
-        bytes = [Float64[] for _ in operations]
-        for operation in operations
-            matrixoperations!(buffers..., operation)
+function sample(name, callers, operation, inboxes, outboxes)
+    if name in treecases
+        return tree_sample(name, callers, operation, inboxes, outboxes)
+    end
+    capacity = parse(Int,get(ENV,"QUEUE_CAPACITY",operation === :generate ? "32768" : "8192"))
+    count = operation === :evict ? parse(Int,get(ENV,"QUEUE_EVICT_COUNT","32768")) : capacity
+    extent = operation === :evict ? capacity + count : capacity
+    cache, readers = makecase(name, callers, capacity, (extent,))
+    width = count ÷ callers
+    rng = Xoshiro(2028)
+    offset = operation === :evict ? capacity : 0
+    keys = [shuffle(rng, collect(offset+(w-1)*width+1:offset+w*width)) for w in 1:callers]
+    if operation === :read
+        prefill = readers
+        populated_count=count
+        for key in 1:populated_count
+            prefill[mod1(cld(key, cld(populated_count, length(prefill))), length(prefill))][key]
         end
-        A, B = inputs[end]
-        @assert found[] == n
-        @assert eigenvectors * Diagonal(eigenvalues) * eigenvectors' ≈ Matrix(Symmetric(A))
-        @assert eigenvectors' * eigenvectors ≈ I
-        @assert eigenvalues ≈ eigvals(Symmetric(A))
-        matrixoperations!(buffers..., Val(:addition))
-        @assert C ≈ A + B
-        matrixoperations!(buffers..., Val(:product))
-        @assert C ≈ A * B
-        for round in 1:ROUNDS
-            GC.gc()
-            for offset in 0:2
-                j = mod1(round + offset, 3)
-                sample = @timed matrixoperations!(buffers..., operations[j])
-                @assert isfinite(sample.value)
-                push!(samples[j], sample.time * 1e9 / 4096)
-                push!(bytes[j], sample.bytes / 4096)
+    end
+    repeats = operation === :read ? readrepeats : 1
+    if operation === :read && readpattern == "varying"
+        @assert readrepeats % 16 == 0
+        keys = [rand(rng, keyset, 16width) for keyset in keys]
+        repeats = readrepeats ÷ 16
+    end
+    prepare = w -> if operation === :generate
+        ()->touch_empty!(readers[w],keys[w])
+    elseif operation === :evict
+        ()->begin
+            touch_empty!(readers[w],keys[w])
+            consume(readers[w],(w-1)*(capacity÷callers)+1:w*(capacity÷callers),1)
+        end
+    else
+        ()->nothing
+    end
+    result = run_sample(readers, keys, repeats, operation === :read, prepare, inboxes, outboxes)
+    if operation in (:read,:generate)
+        @assert all(key->isready(cache,key),1:count)
+    end
+    return result
+end
+
+function run_sample(readers, keys, repeats, warm, prepare, inboxes, outboxes)
+    callers = length(readers)
+    requests = sum(length,keys) * repeats
+    ready, start = Channel{Nothing}(callers), Base.Event()
+    deadline = Ref(UInt64(0))
+    for w in 1:callers
+        put!(inboxes[w], Job(readers[w], keys[w], repeats, warm, prepare(w), deadline, ready, start))
+    end
+    for _ in 1:callers
+        take!(ready)
+    end
+    deadline[]=time_ns()+UInt64(2_000_000)
+    notify(start)
+    result = [take!(outboxes[w]) for w in 1:callers]
+    for outcome in result
+        if outcome isa Exception
+            throw(outcome)
+        end
+    end
+    starts, finishes = first.(result), getindex.(result, 2)
+    @assert sum(last, result) == requests
+    # This window excludes task creation and master-thread collection overhead.
+    # Report start skew and actual overlap rather than assuming simultaneous execution.
+    elapsed = maximum(finishes) - minimum(starts)
+    skew = maximum(starts) - minimum(starts)
+    overlap = callers == 1 || maximum(starts) < minimum(finishes)
+    return (elapsed / requests, skew / max(elapsed,1), overlap)
+end
+
+# Central generation batches independent caches so 63 insertions per central leaf
+# provide a measurable window. Every caller shares the caches, but owns disjoint keys.
+struct TreeBenchmarkBatch{C}
+    caches::Vector{C}
+end
+@inline Base.getindex(batch::TreeBenchmarkBatch, key::Tuple{Int,CartesianIndex{2}}) =
+    @inbounds batch.caches[key[1]][key[2]]
+
+function tree_touch_empty!(cache, keys)
+    cache = cache isa MemoizedArrays.QueueHandle ? cache.cache : cache
+    for key in keys
+        lookup = MemoizedArrays.map_lookup(cache, Tuple(key))
+        ref = cache.map isa MemoizedArrays.TreeMap ?
+            MemoizedArrays.map_slot(cache.map, lookup[1], lookup[2]) : lookup[3]
+        @assert MemoizedArrays.slot_entry(ref) === cache.map.empty
+        MemoizedArrays.slot_publish!(ref, cache.map.empty)
+    end
+end
+
+# The caller owns queue bookkeeping; warming never resets resident memberships.
+function tree_touch_queue!(reader)
+    if reader isa MemoizedArrays.QueueHandle
+        for entry in reader.queue.pool
+            state = @atomic :monotonic entry.state
+            @atomic :monotonic entry.state = state
+        end
+    elseif reader isa LRUMemoizedArray
+        for entry in reader.eviction.entries
+            entry.value = payload
+        end
+    end
+    return nothing
+end
+
+function tree_sample(name, callers, operation, inboxes, outboxes)
+    domain = (-251:260, -251:260)
+    central = vec(collect(CartesianIndices((-3:4, -3:4))))
+    candidates = vec(collect(CartesianIndices(domain)))
+    rng = Xoshiro(2028)
+    if operation in (Symbol("generate-central"), Symbol("evict-central"))
+        batches = parse(Int, get(ENV, "QUEUE_TREE_BATCHES", "64"))
+        evict = operation === Symbol("evict-central")
+        outside = shuffle(rng, filter(key -> !(key in central), candidates))
+        residents = evict ? outside[1:480] : [central[1]; outside[1:448]]
+        requests = evict ? central[33:64] : central[2:64]
+        @assert !evict || 32 % callers == 0
+        setups = [makecase(name, callers, 512, domain) for _ in 1:batches]
+        caches = first.(setups)
+        readers = [TreeBenchmarkBatch([setup[2][w] for setup in setups]) for w in 1:callers]
+        partitions = [requests[1+fld((w-1)*length(requests),callers):fld(w*length(requests),callers)] for w in 1:callers]
+        for (_, handles) in setups
+            offset = 0
+            for w in 1:callers
+                if evict
+                    consume(handles[w], central[1+(w-1)*(32÷callers):w*(32÷callers)], 1)
+                    count = 480 ÷ callers
+                else
+                    # Leave precisely this queue's 7/8 (or63 serial) entry slots free.
+                    count = 512 ÷ callers - length(partitions[w])
+                end
+                consume(handles[w], residents[offset+1:offset+count], 1)
+                offset += count
+            end
+            @assert offset == length(residents)
+        end
+        keys = [[(i, key) for i in 1:batches for key in partitions[w]] for w in 1:callers]
+        prepare = w -> () -> begin
+            for i in 1:batches
+                handle = setups[i][2][w]
+                tree_touch_queue!(handle)
+                tree_touch_empty!(handle, partitions[w])
             end
         end
-        @assert all(iszero, median.(bytes))
-        println("| ", n, "×", n, " | ", join(formattime.(median.(samples)), " | "), " |")
+        result = run_sample(readers, keys, 1, false, prepare, inboxes, outboxes)
+        for cache in caches
+            @assert all(key -> isready(cache, key), requests)
+            @assert all(key -> isready(cache, key), residents)
+            if evict
+                @assert all(key -> !isready(cache, key), central[1:32])
+            else
+                @assert all(key -> isready(cache, key), central)
+            end
+            cache isa LRUMemoizedArray && @assert MemoizedArrays.resident_count(cache) == 512
+        end
+        return result
     end
+
+    isread = operation in (Symbol("read-central"), Symbol("read-spread"))
+    evict = operation === Symbol("evict-spread")
+    count = parse(Int, get(ENV, "QUEUE_CAPACITY", isread ? "8192" : "32768"))
+    @assert count % callers == 0
+    if !isread && !evict
+        filter!(key -> mod(key[1]+3,8) != 0 || mod(key[2]+3,8) != 0, candidates)
+    end
+    shuffled = shuffle(rng, candidates)
+    capacity = isread ? 0 : evict ?
+        parse(Int,get(ENV,"QUEUE_TREE_EVICT_CAPACITY","8192")) :
+        operation === Symbol("generate-existing") ? count+4096 : count
+    requested = evict ? shuffled[capacity+1:capacity+count] : shuffled[1:count]
+    seeds = if isread
+        unique([requested; central])
+    elseif evict
+        shuffled[1:capacity]
+    elseif operation === Symbol("generate-existing")
+        unique(CartesianIndex(fld(key[1]+3,8)*8-3, fld(key[2]+3,8)*8-3) for key in requested)
+    else
+        @assert operation === Symbol("generate-structural")
+        CartesianIndex{2}[]
+    end
+    isread && (capacity = 8cld(length(seeds),8))
+    @assert capacity % callers == 0
+    repeats = isread ? readrepeats : 1
+    width = count ÷ callers
+    if operation === Symbol("read-central")
+        @assert 64 % callers == 0 && count % 64 == 0
+        shuffle!(rng, central)
+        keys = [repeat(central[(w-1)*(64÷callers)+1:w*(64÷callers)],count÷64) for w in 1:callers]
+    else
+        keys = [requested[(w-1)*width+1:w*width] for w in 1:callers]
+    end
+    cache, readers = makecase(name, callers, capacity, domain)
+    if isread
+        if operation === Symbol("read-central")
+            extra = filter(key -> !(key in central),requested)
+            owned = [central[(w-1)*(64÷callers)+1:w*(64÷callers)] for w in 1:callers]
+        else
+            extra = filter(key -> !(key in requested),central)
+            owned = keys
+        end
+        for w in 1:callers
+            residents = [owned[w]; extra[1+fld((w-1)*length(extra),callers):fld(w*length(extra),callers)]]
+            @assert length(residents) <= capacity ÷ callers
+            consume(readers[w],residents,1)
+        end
+    else
+        for w in 1:callers
+            consume(readers[w], seeds[1+fld((w-1)*length(seeds),callers):fld(w*length(seeds),callers)], 1)
+        end
+    end
+    if isread && readpattern == "varying"
+        @assert readrepeats % 16 == 0
+        keys = [rand(rng,keyset,16width) for keyset in keys]
+        repeats = readrepeats ÷ 16
+    end
+    prepare = w -> !isread ? () -> begin
+        tree_touch_queue!(readers[w])
+        operation === Symbol("generate-existing") && tree_touch_empty!(readers[w],keys[w])
+    end : () -> nothing
+    result = run_sample(readers,keys,repeats,isread,prepare,inboxes,outboxes)
+    if evict
+        @assert all(key -> !isready(cache,key),seeds)
+        quota = capacity ÷ callers
+        @assert all(keyset -> all(key -> isready(cache,key),keyset[end-quota+1:end]),keys)
+        @assert MemoizedArrays.resident_count(cache) == capacity
+    else
+        @assert all(key -> isready(cache,key),requested)
+        @assert all(key -> isready(cache,key),seeds)
+    end
+    return result
 end
 
-if abspath(PROGRAM_FILE) == @__FILE__
-    benchmark(; selections(ARGS)...)
-    benchmarkmatrices()
+function produce(inboxes,outboxes)
+    if haskey(ENV,"QUEUE_PRODUCER_CPU")
+        cpu=parse(Int,ENV["QUEUE_PRODUCER_CPU"])
+        mask=Ref{UInt64}(UInt64(1)<<cpu)
+        @assert ccall(:sched_setaffinity,Cint,(Cint,Csize_t,Ptr{UInt64}),0,8,mask)==0
+    end
+    cases = ["memoized-serial","lru-serial","memoized","lru"]
+    cases = split(get(ENV,"QUEUE_CASES",join(cases,',')),',')
+    println("Julia ", VERSION, "; ", Sys.CPU_NAME, "; ",workers," persistent workers; ", rounds, " rotated rounds; worker CPUs ",cpu_offset,":",cpu_offset+workers-1,".")
+    println("Producer thread=",Threads.threadid()," pool=",Threads.threadpool())
+    println("Preconfigured matrices; setup outside timing; aggregate wall ns/request [Q1,Q3].")
+    println("Read pattern: ", readpattern, "; workload definitions: docs/src/benchmarks.md")
+    println("| Case | Operation | Callers | ns/op [Q1,Q3] | Start skew | Overlap |")
+    println("|---|---|---:|---:|---:|---:|")
+    flush(stdout)
+    try
+        for operation in operations, callers in parse.(Int,split(get(ENV,"QUEUE_CALLERS","1,8"),','))
+            selected = filter(cases) do name
+                !(callers > 1 && endswith(name, "serial")) &&
+                    (name in treecases ? operation in treeoperations : operation in (:read, :generate, :evict)) &&
+                    (!startswith(string(operation), "evict") || occursin("lru", name))
+            end
+            samples = [[] for _ in selected]
+            for iteration in 0:rounds
+                GC.gc(false)
+                for index in circshift(collect(eachindex(selected)), iteration)
+                    result = sample(selected[index], callers, operation, inboxes, outboxes)
+                    if iteration > 0
+                        push!(samples[index], result)
+                    end
+                end
+            end
+            for (name, rows) in zip(selected, samples)
+                times = first.(rows)
+                println("| ",name," | ",operation," | ",callers," | ",round(median(times);sigdigits=3),
+                    " [",round(quantile(times,.25);sigdigits=3),",",round(quantile(times,.75);sigdigits=3),
+                    "] | ",round(100median(getindex.(rows,2));digits=2),
+                    "% | ",count(row->row[3],rows),"/",length(rows)," |")
+            end
+            flush(stdout)
+        end
+    finally
+        foreach(channel -> put!(channel,nothing),inboxes)
+    end
+end
+function main()
+    counts = parse.(Int, split(get(ENV,"QUEUE_CALLERS","1,8"), ','))
+    all(n -> 1 <= n <= workers, counts) ||
+        throw(ArgumentError("QUEUE_CALLERS must fit the available Julia threads; use -t 8 for the default 1/8 callers"))
+    inboxes = [Channel{Any}(1) for _ in 1:workers]
+    outboxes = [Channel{Any}(1) for _ in 1:workers]
+    producer = @async produce(inboxes,outboxes)
+    # Sticky static tasks stay on distinct Julia threads. Pin once before jobs,
+    # so affinity changes/migration cannot inflate the timed start window.
+    Threads.@threads :static for w in 1:workers
+        original=Ref{UInt64}(0)
+        mask=Ref{UInt64}(UInt64(1)<<(cpu_offset+w-1))
+        pinned=get(ENV,"QUEUE_PIN","false")=="true"
+        if pinned
+            @assert ccall(:sched_getaffinity,Cint,(Cint,Csize_t,Ptr{UInt64}),0,8,original)==0
+            @assert ccall(:sched_setaffinity,Cint,(Cint,Csize_t,Ptr{UInt64}),0,8,mask)==0
+        end
+        try
+            while true
+                job=take!(inboxes[w])
+                if job===nothing
+                    break
+                end
+                put!(outboxes[w],try run_job(job) catch error; error end)
+            end
+        finally
+            if pinned
+                @assert ccall(:sched_setaffinity,Cint,(Cint,Csize_t,Ptr{UInt64}),0,8,original)==0
+            end
+        end
+    end
+    fetch(producer)
+end
+if abspath(PROGRAM_FILE) == (@__FILE__)
+    main()
 end

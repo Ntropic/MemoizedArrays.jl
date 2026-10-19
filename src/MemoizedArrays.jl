@@ -1,8 +1,8 @@
 # Package entry point: exports, shared types and source includes.
 # Flow: cache[i, j] → ArrayInterface checks coordinates → the selected cache finds or generates a value.
-# Synchronous execution: cache types manage retention; maps locate entries.
+# Cache types manage retention; maps locate entries. MemoizedArray supports opt-in concurrency for every map.
 
-module JITArrays
+module MemoizedArrays
 
 """
     VT{N,T} = Union{AbstractVector{T},NTuple{N,T}}
@@ -28,21 +28,34 @@ macro astuple(N, names...)
     return Expr(:block, (:($(esc(name)) = as_tuple($(esc(name)), Val($(esc(N))))) for name in names)...)
 end
 
-export AbstractJITArray, JITArray, LRUArray, ExactLRUArray, ApproxLRUArray, generate!
-export SparseJITArray, SparseLRUArray
-export getready, unbound, isunbound
+export AbstractMemoizedArray, MemoizedArray, LRUMemoizedArray, generate!
+export getready, unbound, isunbound, queue_handle, queue_handles, with_queue
+export ArrayMap, ExpandingArrayMap, DictMap, RadixMap, SubtreeRadixMap
 
-"""Cache interface parameterized by value type, dimension count and storage type."""
-abstract type AbstractJITArray{ValueType,N,M} <: AbstractArray{ValueType,N} end
+abstract type MapConfig{V} end
+
+"""Cache interface parameterized by value type, dimension count and map type."""
+abstract type AbstractMemoizedArray{ValueType,N,M} <: AbstractArray{ValueType,N} end
 
 abstract type SparseMap{T,N} end
 
-include("caches/JITArray.jl")
-include("caches/ExactLRUArray.jl")
-include("caches/ApproxLRUArray.jl")
+struct Empty end
+const EMPTY = Empty()
+
+
 include("maps/ArrayMap.jl")
+include("maps/ExpandingArrayMap.jl")
 include("maps/DictMap.jl")
 include("maps/TreeMap.jl")
+include("eviction/MultiQueue.jl")
+include("caches/ConcurrentGeneration.jl")
+include("maps/ConcurrentTreeMap.jl")
+include("eviction/PrivateLRU.jl")
+include("eviction/SerialLRU.jl")
+include("maps/LRUDictMap.jl")
+include("maps/ConcurrentDictMap.jl")
+include("caches/MemoizedArray.jl")
+include("caches/LRUMemoizedArray.jl")
 include("ArrayInterface.jl")
 
-end # module JITArrays
+end # module MemoizedArrays

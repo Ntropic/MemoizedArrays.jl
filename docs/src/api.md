@@ -1,19 +1,20 @@
 # API reference
 
 ```@meta
-CurrentModule = JITArrays
+CurrentModule = MemoizedArrays
 ```
 
-`V` is the generated value type; `R <: AbstractUnitRange{Int}` denotes a signed integer range.
+Signatures and docstrings are grouped below. For recipes, see [Examples](examples.md).
+`T` in map constructors is the generated value type.
 
 | API | Contents |
 |---|---|
-| [Caches](api/caches.md) | Unbounded retention, bounded LRU, and access counters |
-| [Storage](api/storage.md) | Arrays, dictionaries, and the two tree backends |
+| [Caches](api/caches.md) | Without eviction, bounded LRU, and queue handles |
+| [Maps](api/maps.md) | Dense/sparse map selection and domains |
 | [Array interface](api/interface.md) | Shared array behavior and synchronous batches |
 
 ```@docs
-AbstractJITArray
+AbstractMemoizedArray
 ```
 
 ## Signature notation

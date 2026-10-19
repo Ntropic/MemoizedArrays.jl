@@ -7,3 +7,4 @@
 /proposals.md
 *.jl.cov
 *.jl.mem
+__pycache__/

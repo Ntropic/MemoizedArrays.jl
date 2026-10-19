@@ -1,4 +1,4 @@
-name = "JITArrays"
+name = "MemoizedArrays"
 uuid = "137b8a29-ca25-4068-8d2b-8b6b6dd43d69"
 authors = ["Michael Schilling"]
 version = "0.1.0"

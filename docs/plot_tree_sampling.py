@@ -12,7 +12,7 @@ ASSETS = Path(__file__).resolve().parent / "src" / "assets"
 GRID = "#7c8590"
 BLUE = "#3684b7"
 CENTRAL = "#299b87"
-plt.rcParams.update({"font.size": 11, "svg.fonttype": "none", "svg.hashsalt": "jitarrays"})
+plt.rcParams.update({"font.size": 11, "svg.fonttype": "none", "svg.hashsalt": "memoizedarrays"})
 
 
 def save(fig, name, title):

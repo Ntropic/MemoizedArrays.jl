@@ -1,5 +1,5 @@
 # Julia array operations: axes, bounds, indexing, views and copying.
-# Also provides shared constructors and storage selection.
+# Also provides domain normalization and coordinate routing.
 
 """`AxisExtent(lo, hi)` defines inclusive axis bounds; coordinates index themselves."""
 struct AxisExtent{Full} <: AbstractUnitRange{Int}
@@ -27,105 +27,41 @@ end
 Base.iterate(axis::AxisExtent) = isempty(axis) ? nothing : (first(axis), first(axis))
 Base.iterate(axis::AxisExtent, state::Int) = state == last(axis) ? nothing : (state + 1, state + 1)
 
-"""`LRUArray{V}(generator, dims...; capacity, policy=:sieve, kwargs...)`: policies `:sieve` (default), `:batch_reinsert`, `:batch_age`, `:exact`."""
-const LRUArray{V,N} = Union{ExactLRUArray{V,N},ApproxLRUArray{V,N}}
-const ArrayBacked{V,N} = AbstractJITArray{V,N,M} where {M<:ArrayMap}
-const SparseArray{V,N} = AbstractJITArray{V,N,M} where {M<:SparseMap}
-"""
-    SparseJITArray{V}(generator; ndims, storage=:dict, kwargs...)
-    SparseJITArray{V}(generator, ranges...; kwargs...)
+const SparseArray{V,N} = AbstractMemoizedArray{V,N,M} where {M<:SparseMap}
 
-Cache signed coordinates without eviction. Omitted ranges share the Int linear-index capacity.
-"""
-const SparseJITArray{V,N} = JITArray{V,N,M} where {M<:SparseMap}
-"""
-    SparseLRUArray{V}(generator; ndims, capacity, policy=:sieve, kwargs...)
-    SparseLRUArray{V}(generator, ranges...; capacity, kwargs...)
-
-Cache signed coordinates with eviction. Omitted ranges share the Int linear-index capacity.
-"""
-const SparseLRUArray{V,N} = Union{ExactLRUArray{V,N,M},ApproxLRUArray{V,N,M}} where {M<:SparseMap}
-
-function LRUArray{V}(generator, domain::VT{N,T}; capacity::Int,
-    policy::Symbol=:sieve, kwargs...) where {V,N,T}
-    if policy === :exact
-        return ExactLRUArray{V}(generator, domain; capacity, kwargs...)
-    end
-    return ApproxLRUArray{V}(generator, domain; capacity, policy, kwargs...)
-end
-
-SparseJITArray{V}(generator, axes::VT{N,R}; storage=:dict, kwargs...) where {V,N,R} = JITArray{V}(generator, axes; storage, kwargs...)
-SparseLRUArray{V}(generator, axes::VT{N,R}; capacity::Int, storage=:dict, kwargs...) where {V,N,R} = LRUArray{V}(generator, axes; capacity, storage, kwargs...)
-
-SparseJITArray{V}(generator; ndims::Int, kwargs...) where V = SparseJITArray{V}(generator, int_axes(ndims); kwargs...)
-SparseLRUArray{V}(generator; ndims::Int, kwargs...) where V = SparseLRUArray{V}(generator, int_axes(ndims); kwargs...)
-
-function int_axes(ndims::Int)
-    ndims < 0 && throw(ArgumentError("ndims must be nonnegative"))
-    if ndims == 0
-        return ()
-    end
-    width = typemax(Int)
-    if ndims > 1
-        lo, hi = 1, 1 << cld(8sizeof(Int) - 1, ndims)
-        while hi - lo > 1
-            mid = lo + (hi - lo) ÷ 2
-            if big(mid)^ndims <= typemax(Int)
-                lo = mid
-            else
-                hi = mid
-            end
-        end
-        width = lo
-    end
-    start = -(width ÷ 2)
-    return ntuple(_ -> AxisExtent(start, start + width - 1), ndims)
-end
-
-LRUArray{V}(generator, axis::Union{Int,AbstractUnitRange{Int}}, axes::Union{Int,AbstractUnitRange{Int}}...; kwargs...) where V = LRUArray{V}(generator, (axis, axes...); kwargs...)
-SparseJITArray{V}(generator, axis::AbstractUnitRange{Int}, axes::AbstractUnitRange{Int}...; kwargs...) where V = SparseJITArray{V}(generator, (axis, axes...); kwargs...)
-SparseLRUArray{V}(generator, axis::Union{Int,AbstractUnitRange{Int}}, axes::Union{Int,AbstractUnitRange{Int}}...; kwargs...) where V = SparseLRUArray{V}(generator, (axis, axes...); kwargs...)
-
-LRUArray{V}(domain::VT{N,T}, capacity::Int, generator::Function; kwargs...) where {V,N,T} = LRUArray{V}(generator, domain; capacity, kwargs...)
-SparseJITArray{V}(domain::VT{N,T}, generator::Function; kwargs...) where {V,N,T} = SparseJITArray{V}(generator, domain; kwargs...)
-SparseLRUArray{V}(domain::VT{N,T}, capacity::Int, generator::Function; kwargs...) where {V,N,T} = SparseLRUArray{V}(generator, domain; capacity, kwargs...)
-
-Base.size(cache::ArrayBacked) = cache.map.shape
-Base.axes(cache::ArrayBacked) = cache.domain
 Base.axes(cache::SparseArray) = cache.map.domain
 Base.size(cache::SparseArray) = map(length, cache.map.domain)
 Base.size(cache::SparseArray, d::Int) = d > ndims(cache) ? 1 : length(cache.map.domain[d])
 Base.length(cache::SparseArray) = domain_length(cache.map.domain)
-Base.IndexStyle(::Type{<:ArrayBacked}) = IndexLinear()
-Base.IndexStyle(::Type{<:SparseArray}) = IndexCartesian()
-Base.similar(cache::AbstractJITArray, ::Type{T}, dims::Dims) where T = Array{T}(undef, dims)
+Base.IndexStyle(::Type{<:AbstractMemoizedArray}) = IndexCartesian()
+Base.similar(cache::AbstractMemoizedArray, ::Type{T}, dims::Dims) where T = Array{T}(undef, dims)
 
-Base.@propagate_inbounds function Base.getindex(cache::AbstractJITArray{V,N}, indices::Vararg{Int,N}) where {V,N}
-    key = cache_key(cache, indices)
-    return cacheget(cache, key, indices)::V
+Base.@propagate_inbounds function Base.getindex(cache::AbstractMemoizedArray{V,N}, indices::Vararg{Int,N}) where {V,N}
+    return cache_get(cache, indices)::V
 end
-Base.@propagate_inbounds Base.getindex(cache::AbstractJITArray{V}, address::Int) where V = cacheget(cache, cache_key(cache, address))::V
-Base.@propagate_inbounds Base.getindex(cache::AbstractJITArray, key::CartesianIndex) = cache[Tuple(key)...]
-Base.@propagate_inbounds Base.getindex(cache::AbstractJITArray, indices...) = array_index(cache, to_indices(cache, indices))
-
-"""`getready(cache, indices...)` reads an already populated ArrayMap-backed JITArray without generating."""
-Base.@propagate_inbounds function getready(cache::JITArray{V,N,M}, indices::Vararg{Int}) where {V,N,M<:ArrayMap}
-    if length(indices) == N
-        return slot_entry(store_lookup(cache.map, cache_key(cache, indices), nothing)).value::V
-    end
-    @boundscheck checkbounds(cache, indices...)
-    address = length(indices) == 1 ? cache_key(cache, indices[1]) : (@inbounds LinearIndices(cache)[indices...])
-    return slot_entry(store_lookup(cache.map, address, nothing)).value::V
+Base.@propagate_inbounds function cache_get(cache::AbstractMemoizedArray{V}, indices::Tuple) where V
+    lookup = map_lookup(cache, indices)
+    return cache_get(cache, lookup, indices)::V
+end
+Base.@propagate_inbounds Base.getindex(cache::AbstractMemoizedArray, key::CartesianIndex) = cache[Tuple(key)...]
+Base.@propagate_inbounds function Base.getindex(cache::AbstractMemoizedArray{V,N}, indices...) where {V,N}
+    length(indices) == N || throw(ArgumentError("supply one index per cache dimension; linear indexing is unsupported"))
+    return array_index(cache, to_indices(cache, indices))
+end
+Base.@propagate_inbounds function Base.view(cache::AbstractMemoizedArray{V,N}, indices...) where {V,N}
+    length(to_indices(cache, indices)) == N || throw(ArgumentError("supply one index per cache dimension; linear views are unsupported"))
+    return invoke(Base.view, Tuple{AbstractArray,Vararg{Any}}, cache, indices...)
 end
 
+@inline ready_value(cache, stored) = stored.value
+@inline ready_entry(cache, stored) = stored !== cache.map.empty
 """`isready(cache, indices...)` checks for a cached value without generating or changing recency."""
-Base.@propagate_inbounds Base.isready(cache::AbstractJITArray{V,N}, indices::Vararg{Int,N}) where {V,N} = entry(cache, cache_key(cache, indices)) !== cache.map.empty
-Base.@propagate_inbounds Base.isready(cache::AbstractJITArray, address::Int) = entry(cache, cache_key(cache, address)) !== cache.map.empty
-Base.@propagate_inbounds function Base.isready(cache::AbstractJITArray{V,N}, key::VT{N,Int}) where {V,N}
+Base.@propagate_inbounds Base.isready(cache::AbstractMemoizedArray{V,N}, indices::Vararg{Int,N}) where {V,N} = ready_entry(cache, entry(cache, cache_key(cache, indices)))
+Base.@propagate_inbounds function Base.isready(cache::AbstractMemoizedArray{V,N}, key::VT{N,Int}) where {V,N}
     @astuple N key
     return isready(cache, key...)
 end
-Base.@propagate_inbounds Base.isready(cache::AbstractJITArray, key::CartesianIndex) = isready(cache, Tuple(key))
+Base.@propagate_inbounds Base.isready(cache::AbstractMemoizedArray, key::CartesianIndex) = isready(cache, Tuple(key))
 
 """
     generate!(cache, indices...)
@@ -133,25 +69,29 @@ Base.@propagate_inbounds Base.isready(cache::AbstractJITArray, key::CartesianInd
 
 Return one value, or generate a batch synchronously and return the cache. Integer tuples denote one coordinate.
 """
-Base.@propagate_inbounds generate!(cache::AbstractJITArray, indices::Vararg{Int,N}) where N = cache[indices...]
-Base.@propagate_inbounds generate!(cache::AbstractJITArray{V,N}, key::NTuple{N,Int}) where {V,N} = cache[key...]
-Base.@propagate_inbounds generate!(cache::AbstractJITArray{V,0}, key::Tuple{}) where V = cache[]
-Base.@propagate_inbounds generate!(cache::AbstractJITArray, key::CartesianIndex) = cache[key]
-function generate!(cache::AbstractJITArray{V,N},
+Base.@propagate_inbounds generate!(cache::AbstractMemoizedArray, indices::Vararg{Int,N}) where N = cache[indices...]
+Base.@propagate_inbounds generate!(cache::AbstractMemoizedArray{V,N}, key::NTuple{N,Int}) where {V,N} = cache[key...]
+Base.@propagate_inbounds generate!(cache::AbstractMemoizedArray{V,0}, key::Tuple{}) where V = cache[]
+Base.@propagate_inbounds generate!(cache::AbstractMemoizedArray, key::CartesianIndex) = cache[key]
+function generate!(cache::AbstractMemoizedArray{V,N},
     requests::Union{VT{B,NTuple{N,Int}},AbstractVector{Int},AbstractVector{CartesianIndex{N}}}) where {V,N,B}
     for key in requests
-        batch_value(cache, key)
+        generate!(cache, key)
     end
     return cache
 end
 
-# Shared source-key forwarding for slices, views and reshapes.
-const CacheReshape = Base.ReshapedArray{<:Any,<:Any,<:AbstractJITArray}
-const CacheParent = Union{AbstractJITArray,CacheReshape}
-const CacheView = SubArray{<:Any,<:Any,<:CacheParent}
-const CacheSource = Union{CacheParent,CacheView}
-Base.copyto!(dest::AbstractArray, source::CacheSource) = copysource!(dest, source)
-Base.copyto!(dest::PermutedDimsArray, source::CacheSource) = copysource!(dest, source)
+# Copy coordinate selections without requesting linear cache indices.
+const CacheView = SubArray{<:Any,<:Any,<:AbstractMemoizedArray}
+const CacheSource = Union{AbstractMemoizedArray,CacheView}
+function Base.copyto!(dest::AbstractArray, source::CacheSource)
+    cache, keys = source_keys(source)
+    return copyvalues!(dest, cache, keys)
+end
+function Base.copyto!(dest::PermutedDimsArray, source::CacheSource)
+    cache, keys = source_keys(source)
+    return copyvalues!(dest, cache, keys)
+end
 Base.copy(source::CacheSource) = copyto!(Array{eltype(source)}(undef, size(source)), source)
 
 # Helpers -------------------------------------------------------------------------------
@@ -179,122 +119,37 @@ axis_domain(::Colon) = AxisExtent(typemin(Int), typemax(Int))
 axis_domain(axis::AbstractUnitRange{Int}) = first(axis) == 1 ? Base.OneTo(last(axis)) : AxisExtent(first(axis), last(axis))
 axis_domain(axis) = throw(ArgumentError("domain axes must be integer lengths, integer unit ranges, or :"))
 
-# Each policy supplies its entry kind; domain validation and map selection happen here once.
-function make_cache_map(kind, ::Type{V}, input::VT{N,T}, storage, block, center=nothing) where {V,N,T}
-    @astuple length(input) input
-    domain = map(axis_domain, input)
-    unbounded = any(isunbound, domain)
-    if storage === nothing
-        storage = unbounded ? :dict : :array
-    end
-    if storage === :array && unbounded
-        throw(ArgumentError("ArrayMap requires a finite domain"))
-    elseif !(storage in (:array, :dict, :radixtree, :subtree))
-        throw(ArgumentError("unknown storage $storage; use :array, :dict, :radixtree, or :subtree"))
-    end
-    if storage in (:radixtree, :subtree)
-        if block === nothing
-            throw(ArgumentError("tree storage requires block_shape"))
-        end
-    elseif block !== nothing
-        throw(ArgumentError("block shapes apply only to tree storage"))
-    end
-    if center !== nothing && !(storage in (:radixtree, :subtree))
-        throw(ArgumentError("center applies only to tree storage"))
-    end
-    center = center === nothing ? 0.5 : center
-    Key = storage === :array ? Int : NTuple{length(domain),Int}
-    E, empty = map_entry(kind, V, Key, storage)
-    if storage === :array
-        return ArrayMap(E, map(length, domain), empty), domain
-    end
-    domain = map(axis -> AxisExtent(first(axis), last(axis)), domain)
-    if storage === :dict
-        return DictMap(E, domain, empty), domain
-    elseif storage === :radixtree
-        return RadixMap(E, domain, block, empty; center), domain
-    end
-    return SubtreeRadixMap(E, domain, block, empty; center), domain
-end
-
-function map_entry(::Type{JITEntry}, ::Type{V}, Key, storage) where V
-    if storage === :dict
-        return Union{Empty,JITEntry{V}}, EMPTY
-    end
-    return ArrayEntry{V}, ArrayEntry{V}()
-end
-map_entry(::Type{ExactLRUEntry}, ::Type{V}, Key, storage) where V = (ExactLRUEntry{V,Key}, ExactLRUEntry{V,Key}())
-map_entry(::Type{BatchEntry{R}}, ::Type{V}, Key, storage) where {R,V} = (BatchEntry{R,V,Key}, BatchEntry{R,V,Key}())
-map_entry(kind, ::Type{V}, Key, storage) where V = (Union{Empty,kind{V,Key}}, EMPTY)
 
 # The precomputed offsets belong to the cache type, with no coordinate-time geometry work.
-routing_offset(map) = ()
-routing_offset(map::TreeMap) = tree_offset(map)
-@inline encode_coordinates(cache, key::NTuple{N,Int}, ::Val{Offset}) where {N,Offset} =
-    ntuple(i -> reinterpret(UInt, key[i]) + Offset[i], Val(N))
-
+routing_offset(::Type) = ()
+routing_offset(map) = routing_offset(typeof(map))
+@generated function cache_offset(::AbstractMemoizedArray{V,N,M}) where {V,N,M}
+    offset = routing_offset(M)
+    return :(Val{$(QuoteNode(offset))}())
+end
 @inline cache_routing(cache, key) = cache_routing(cache, key, cache.map)
-@inline cache_routing(cache, key, map) = store_hash(map, key)
-@inline cache_routing(cache, key, ::RadixMap) = encode_coordinates(cache, key, cache_offset(cache))
-@inline function cache_routing(cache, key, ::SubtreeRadixMap)
-    offset = cache_offset(cache)
-    encoded = encode_coordinates(cache, key, offset)
-    return encoded, subtree_index(cache, encoded, offset)
-end
-@inline subtree_index(cache, encoded, ::Val{Offset}) where Offset =
-    tree_level(cache.map, ntuple(i -> encoded[i] ⊻ Offset[i], length(Offset))) + 1
-
+@inline cache_routing(cache, key, map) = map_routing(map, key)
 @inline delete_entry!(cache, key) = delete_key!(cache.map, key)
-@inline function delete_entry!(cache::AbstractJITArray{V,N,M}, key) where {V,N,M<:TreeMap}
-    return delete_key!(cache.map, key, encode_coordinates(cache, key, cache_offset(cache)))
-end
 
 # ArrayMap receives slot addresses; sparse maps receive coordinate tuples.
-Base.@propagate_inbounds function cache_key(cache::ArrayBacked, key::Tuple)
-    @boundscheck checkbounds(cache, key...)
-    return slotaddress(cache.map, map((i, axis) -> i - first(axis) + 1, key, axes(cache)))
-end
-Base.@propagate_inbounds function cache_key(cache::ArrayBacked, address::Int)
-    @boundscheck checkbounds(cache, address)
-    return ndims(cache) == 1 ? address - first(axes(cache, 1)) + 1 : address
-end
 Base.@propagate_inbounds function cache_key(cache::SparseArray{V,N}, key::NTuple{N,Int}) where {V,N}
-    @boundscheck check_coordinate_bounds(cache, key)
+    @boundscheck checkbounds(cache, key...)
     return key
 end
-Base.@propagate_inbounds cache_key(cache::SparseArray, address::Int) = index_coordinates(cache, address)
-Base.@propagate_inbounds cache_key(cache::AbstractJITArray, key::CartesianIndex) = cache_key(cache, Tuple(key))
-@inline generator_indices(cache::ArrayBacked, key::Int) = @inbounds offset_coordinates(axes(cache), key - 1)
-@inline generator_indices(cache::SparseArray, key::Tuple) = key
-@inline generator_indices(cache, key, indices::Tuple) = indices
-@inline generator_indices(cache, key, ::Nothing) = generator_indices(cache, key)
+Base.@propagate_inbounds cache_key(cache::AbstractMemoizedArray, key::CartesianIndex) = cache_key(cache, Tuple(key))
 
-# Scalar indexing follows Base; finite selections use a lazy key proxy.
-Base.@propagate_inbounds function array_index(cache::AbstractJITArray, indices::Tuple{Vararg{Int}})
-    if length(indices) == ndims(cache) || length(indices) == 1
-        return cache[indices...]
-    end
-    return Base._getindex(IndexStyle(cache), cache, indices...)
-end
-Base.@propagate_inbounds function array_index(cache::AbstractJITArray, indices::Tuple)
+# Coordinate selections use Base's lazy Cartesian index array.
+Base.@propagate_inbounds array_index(cache::AbstractMemoizedArray, indices::Tuple{Vararg{Int}}) = cache[indices...]
+Base.@propagate_inbounds function array_index(cache::AbstractMemoizedArray, indices::Tuple)
     _, source = source_keys(cache)
     keys = view(source, indices...)
     return copyvalues!(Array{eltype(cache)}(undef, size(keys)), cache, keys)
 end
-source_keys(cache::ArrayBacked) = (cache, CoordinateIndices(axes(cache)))
-source_keys(cache::SparseArray) = (cache, CoordinateIndices(cache.map.domain))
-function source_keys(source::CacheReshape)
-    cache, keys = source_keys(parent(source))
-    return cache, reshape(keys, size(source))
-end
+source_keys(cache::AbstractMemoizedArray) = (cache, CartesianIndices(axes(cache)))
 function source_keys(source::CacheView)
     cache, keys = source_keys(parent(source))
     return cache, view(keys, parentindices(source)...)
 end
-
-@inline batch_value(cache::AbstractJITArray, key) = cacheget(cache, cache_key(cache, key))
-@inline batch_value(cache::AbstractJITArray, key::Tuple) = cacheget(cache, cache_key(cache, key), key)
-@inline batch_value(cache::AbstractJITArray, key::CartesianIndex) = batch_value(cache, Tuple(key))
 
 # Extents can exceed Int even though both coordinate endpoints fit.
 function checked_extent(axis::AxisExtent)
@@ -316,47 +171,8 @@ function domain_length(ranges)
     return count
 end
 
-@inline function check_coordinate_bounds(cache::SparseArray{V,N}, key::NTuple{N,Int}) where {V,N}
-    for i in 1:N
-        if !checkindex(Bool, cache.map.domain[i], key[i])
-            throw(BoundsError(cache, key))
-        end
-    end
-    return nothing
-end
-
-Base.@propagate_inbounds function index_coordinates(cache::SparseArray{V,N}, address::Int) where {V,N}
-    count = length(cache)
-    @boundscheck if !(1 <= address <= count)
-        throw(BoundsError(cache, address))
-    end
-    return offset_coordinates(cache.map.domain, address - 1)
-end
-
-@inline offset_coordinates(ranges::Tuple{}, address::Int) = ()
-@inline function offset_coordinates(ranges::Tuple, address::Int)
-    remaining, offset = divrem(address, length(first(ranges)))
-    return (first(first(ranges)) + offset, offset_coordinates(Base.tail(ranges), remaining)...)
-end
-Base.@propagate_inbounds function index_coordinates(cache::SparseArray{V,1}, address::Int) where V
-    @boundscheck check_coordinate_bounds(cache, (address,))
-    return (address,)
-end
-# A lazy coordinate array lets Base handle finite selectors and view composition.
-struct CoordinateIndices{N,D<:Tuple{Vararg{Any,N}}} <: AbstractArray{NTuple{N,Int},N}
-    ranges::D
-end
-Base.axes(keys::CoordinateIndices) = keys.ranges
-Base.size(keys::CoordinateIndices) = map(length, keys.ranges)
-Base.length(keys::CoordinateIndices) = domain_length(keys.ranges)
-Base.IndexStyle(::Type{<:CoordinateIndices}) = IndexCartesian()
-Base.@propagate_inbounds function Base.getindex(keys::CoordinateIndices{N}, key::Vararg{Int,N}) where N
-    @boundscheck checkbounds(keys, key...)
-    return key
-end
-
 @inline function entry(cache, key)
-    slot = store_lookup(cache.map, key, cache_routing(cache, key))
+    slot = map_slot(cache.map, key, cache_routing(cache, key))
     return slot === nothing ? cache.map.empty : slot_entry(slot)
 end
 
@@ -369,13 +185,7 @@ function copyvalues!(dest, cache, keys)
         keys = copy(keys)
     end
     for (i, key) in zip(eachindex(dest), keys)
-        @inbounds dest[i] = batch_value(cache, key)
+        @inbounds dest[i] = cache[key]
     end
     return dest
-end
-
-# Views and reshapes supply their selected keys to the copy loop.
-function copysource!(dest, source)
-    cache, keys = source_keys(source)
-    return copyvalues!(dest, cache, keys)
 end
