@@ -1,0 +1,133 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LRU queue accesses and eviction</title>
+<style>
+:root { --ink: #555; --active: #3684b7; --keep: #299b87; }
+@media(prefers-color-scheme:dark) { :root { --ink:#ddd; --active:#65b8eb; } }
+html, body { margin:0; background:transparent !important; }
+body { color:var(--ink); font:14px system-ui,sans-serif; }
+main { display:flow-root; max-width:660px; margin:auto; padding:8px 0; }
+.controls { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+button { font:inherit; color:inherit; background:transparent; border:1px solid currentColor; border-radius:4px; padding:3px 9px; cursor:pointer; }
+button:disabled { opacity:.4; cursor:default; }
+progress { flex:1; min-width:80px; height:6px; accent-color:var(--active); }
+svg { display:block; width:100%; height:auto; overflow:visible; }
+rect { fill:transparent; stroke:var(--ink); }
+text { fill:var(--ink); font:14px system-ui,sans-serif; text-anchor:middle; dominant-baseline:middle; }
+.active rect, rect.active { stroke:var(--active); fill:color-mix(in srgb,var(--active) 14%,transparent); stroke-width:2; }
+.active text { fill:var(--active); }
+.ref { transition:transform .45s ease; }
+path, line { fill:none; stroke:var(--active); stroke-width:1.5; }
+.zoom { opacity:.5; }
+.victim rect { stroke:var(--keep); stroke-width:2; }
+.logic { opacity:.4; }
+.logic.active { opacity:1; }
+.logic text { font-size:14px; }
+@media(prefers-reduced-motion:reduce) { .ref { transition:none; } }
+</style>
+<main>
+<div class="controls"><button id="back" aria-label="Previous step">←</button><button id="play">Play</button><button id="next" aria-label="Next step">→</button><button id="reset">Reset</button><progress id="progress" value="0" max="1" aria-label="Animation progress"></progress><span id="position"></span></div>
+<svg viewBox="0 0 660 275" role="img" aria-label="Map slots, entry detail and two LRU queues">
+<defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10" style="fill:var(--active);stroke:none"/></marker></defs>
+<text x="74" y="22">Map slots</text><g id="map"></g>
+<g id="zoom"></g><g id="detail"></g>
+<text x="84" y="174">Q₁</text><text x="244" y="174">Q₂</text>
+<g id="queues"></g><g id="arrows"></g>
+<text x="84" y="248">oldest → newest</text><text x="244" y="248">oldest → newest</text>
+<g id="logic"></g>
+</svg>
+</main>
+<script>
+const ns='http://www.w3.org/2000/svg';
+function el(tag,attrs={},text='') { const e=document.createElementNS(ns,tag); for(const [k,v] of Object.entries(attrs)) e.setAttribute(k,v); e.textContent=text; return e; }
+const letters=['A','B','C','D','E','F'];
+const events=[[0,'A'],[0,'B'],[0,'C'],[1,'D'],[1,'E'],[1,'A'],[0,'D'],[0,'E']];
+const frames=[{queues:[[],[]],last:{},removed:[],route:[]}];
+for(const [q,key] of events) {
+ const prior=frames.at(-1), s={queues:prior.queues.map(a=>a.slice()),last:{...prior.last},removed:[...prior.removed],q,key,route:['access']};
+ const index=s.queues[q].indexOf(key);
+ if(index>=0) s.queues[q].splice(index,1);
+ else if(s.queues[q].length===3) {
+  const victim=s.queues[q].shift(), keep=s.last[victim]!==q;
+  s.victim=victim; s.victimQueue=s.last[victim];
+  s.route.push('version','hint',keep?'keep':'claim');
+  if(!keep){s.removed.push(victim);s.route.push('remove');}
+ }
+ s.queues[q].push(key); s.last[key]=q;
+ frames.push(s);
+}
+let step=0,timer=null,phases=[];
+const cells={},refs=[{},{}];
+letters.forEach((key,i)=>{const x=20+(i%3)*36,y=40+Math.floor(i/3)*36; const g=el('g');g.append(el('rect',{x,y,width:36,height:36}),el('text',{x:x+18,y:y+18},key));document.querySelector('#map').append(g);cells[key]={g,x,y};});
+for(let q=0;q<2;q++) { const x=q?190:30; for(let i=0;i<3;i++)document.querySelector('#queues').append(el('rect',{x:x+i*36,y:194,width:36,height:36}));for(const key of letters){const g=el('g',{class:'ref'});g.append(el('rect',{width:36,height:36}),el('text',{x:18,y:18},key));document.querySelector('#queues').append(g);refs[q][key]=g;}}
+const logicNodes={};
+const logic=document.querySelector('#logic');
+function logicBox(id,x,y,w,text){const g=el('g',{class:'logic'});g.append(el('rect',{x,y,width:w,height:30,rx:3}),el('text',{x:x+w/2,y:y+15},text));logic.append(g);logicNodes[id]=g;}
+logicBox('access',355,15,280,'Read → newest; stamp last_access');
+logicBox('version',355,70,280,'Queue full? Check oldest version');
+logicBox('hint',355,125,280,'Current hint names another queue?');
+logicBox('keep',355,235,130,'Drop reference');
+logicBox('claim',505,180,130,'Claim entry');
+logicBox('remove',505,235,130,'Remove mapping');
+for(const [x1,y1,x2,y2] of [[495,45,495,70],[495,100,495,125],[570,155,570,180],[570,210,570,235],[420,155,420,235]])logic.append(el('line',{x1,y1,x2,y2,'marker-end':'url(#arrow)',class:'zoom'}));
+logic.append(el('text',{x:395,y:188},'Yes'),el('text',{x:598,y:167},'No'));
+function render(s=frames[step], hideNew=false){
+ for(const key of letters){cells[key].g.setAttribute('class',s.key===key?'active':s.victim===key?'victim':'');cells[key].g.lastChild.textContent=s.removed.includes(key)?'':key;}
+ for(let q=0;q<2;q++)for(const key of letters){
+  const g=refs[q][key],i=s.queues[q].indexOf(key),visible=i>=0;
+  const x=(q?190:30)+(3-s.queues[q].length+Math.max(i,0))*36;
+  if(visible&&g.style.display==='none'){
+   g.style.transition='none';g.style.transform=`translate(${(q?190:30)+108}px,194px)`;g.style.display='';g.getBoundingClientRect();g.style.transition='';
+  }
+  g.style.display=visible&&!(hideNew&&q===s.q&&key===s.key)?'':'none';g.style.transform=`translate(${x}px,194px)`;
+  g.setAttribute('class','ref'+(s.key===key&&s.q===q?' active':''));
+ }
+ for(const [id,g] of Object.entries(logicNodes))g.setAttribute('class','logic'+(s.route.includes(id)?' active':''));
+ logicNodes.version.lastChild.textContent=s.victim?`Oldest ${s.victim}: same live version ✓`:'Queue full? Check oldest version';
+ logicNodes.hint.lastChild.textContent=s.victim?`${s.victim}.last_access = Q${s.victimQueue+1}; another queue?`:'Current hint names another queue?';
+ for(const id of ['arrows','zoom','detail'])document.getElementById(id).replaceChildren();
+ if(s.key){
+  const c=cells[s.key],d=document.querySelector('#detail');
+  document.querySelector('#zoom').append(el('line',{class:'zoom',x1:c.x+36,y1:c.y,x2:155,y2:40}),el('line',{class:'zoom',x1:c.x+36,y1:c.y+36,x2:155,y2:115}));
+  d.append(el('rect',{x:155,y:40,width:170,height:75,class:'active'}),el('text',{x:240,y:56},`Entry ${s.key} · value = …`),el('text',{x:240,y:80},`last_access: Q${s.last[s.key]+1}`),el('text',{x:240,y:101},'version v'));
+  const x=s.q?244:84;
+  document.querySelector('#arrows').append(el('path',{d:`M ${x} 190 Q ${x} 145 ${c.x+18} ${c.y+36}`, 'marker-end':'url(#arrow)'}));
+ }
+ document.querySelector('#position').textContent=`${step+1} / ${frames.length}`;
+ document.querySelector('#progress').max=frames.length-1;document.querySelector('#progress').value=step;
+ document.querySelector('#back').disabled=step===0;document.querySelector('#next').disabled=step===frames.length-1;
+}
+function pause(){clearInterval(timer);timer=null;document.querySelector('#play').textContent='Play';}
+function cancelPhases(){phases.forEach(clearTimeout);phases=[];document.querySelectorAll('.cross').forEach(e=>e.remove());}
+function cross(group,x=0,y=0){group.append(el('path',{class:'cross',d:`M ${x+6} ${y+6} l 24 24 M ${x+30} ${y+6} l -24 24`,style:'stroke:var(--keep);stroke-width:2.5'}));}
+function showAccess(previous){
+ cancelPhases();
+ const s=frames[step];
+ const reduced=matchMedia('(prefers-reduced-motion: reduce)').matches;
+ if(step!==previous+1||reduced){render();return;}
+ render(frames[previous]);
+ const removing=!!s.victim;
+ if(removing){
+  cross(refs[s.q][s.victim]);
+  if(s.removed.includes(s.victim)){const c=cells[s.victim];cross(c.g,c.x,c.y);}
+ }
+ const shift=()=>{
+  document.querySelectorAll('.cross').forEach(e=>e.remove());
+  render(s,true);
+  // Existing references finish their 450 ms shift before the new one appears.
+  phases.push(setTimeout(()=>render(s),470));
+ };
+ if(removing)phases.push(setTimeout(shift,380));else shift();
+}
+function move(n){pause();const previous=step;step=Math.max(0,Math.min(frames.length-1,step+n));showAccess(previous);}
+document.querySelector('#back').onclick=()=>move(-1);document.querySelector('#next').onclick=()=>move(1);
+document.querySelector('#reset').onclick=()=>{pause();cancelPhases();step=0;render();};
+document.querySelector('#play').onclick=()=>{if(timer)return pause();cancelPhases();if(step===frames.length-1)step=0;document.querySelector('#play').textContent='Pause';render();timer=setInterval(()=>{const previous=step;step++;showAccess(previous);if(step===frames.length-1)pause();},1800);};
+document.addEventListener('keydown',e=>{if(e.key==='ArrowRight'||e.key==='ArrowLeft'){e.preventDefault();move(e.key==='ArrowRight'?1:-1);}});
+try{const page=parent.document.querySelector('#documenter-page');if(page){const sync=()=>document.documentElement.style.setProperty('--ink',parent.getComputedStyle(page).color);sync();new MutationObserver(sync).observe(parent.document.documentElement,{attributes:true,attributeFilter:['class']});page.addEventListener('transitionend',sync);}}catch(e){if(e.name!=='SecurityError')throw e;}
+function fit(){if(window.frameElement)window.frameElement.style.height=(Math.ceil(document.querySelector('main').getBoundingClientRect().height)+4)+'px';}
+new ResizeObserver(fit).observe(document.querySelector('main'));render();fit();
+</script>
+</html>

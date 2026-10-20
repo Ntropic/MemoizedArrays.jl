@@ -2,48 +2,42 @@
 
 ```@meta
 CurrentModule = MemoizedArrays
-DocTestSetup = :(using MemoizedArrays)
 ```
 
 
 ## MemoizedArray
-In the simplest case we generate a conventional array via `ArrayMap`
-```jldoctest
-julia> value_at(i, j) = i + j;
-
-julia> values = MemoizedArray(value_at, ArrayMap{Int}((100, 100)));
-
-julia> values[2, 3]
-5
+In the simplest case we define a  generate a conventional array via `ArrayMap`
+```@example basic
+using MemoizedArrays # hide
+generator(i, j) = i + j;
+values = MemoizedArray(generator, ArrayMap{Int}((100, 100)));
+values[2, 3]
 ```
+`MemoizedArray` stores any generated values - it does not evict old and unused values. Use `ArrayMap` for a fixed finite domain.
 
-`MemoizedArray` keeps generated values. Use `ArrayMap` for a fixed finite domain.
+The generator can be selfreferential, requesting values of the array it constructs, by using the `do` syntax 
 
-The generator can request earlier values from the same array:
-
-```jldoctest
-julia> values = MemoizedArray(ArrayMap{Int}((8,))) do i
-           values[i - 1] + 1
-       end;
-
-julia> values[1] = 1;
-
-julia> values[8]
-8
+```@example recursive
+using MemoizedArrays # hide
+values = MemoizedArray(ArrayMap{Int}((8,))) do i
+    values[i - 1] + 1
+end;
+values[1] = 1;
+values[8]
 ```
 
 Dependencies must be acyclic: a generator cannot request its own unfinished value.
 
 ## LRUMemoizedArray
 
-```jldoctest
-julia> values = LRUMemoizedArray(identity, ArrayMap{Int}((10,)); capacity=2);
+```@example lru
+using MemoizedArrays # hide
+values = LRUMemoizedArray(identity, ArrayMap{Int}((10,)); capacity=2);
+values[1], values[2], values[1], values[3]
+```
 
-julia> values[1], values[2], values[1], values[3]
-(1, 2, 1, 3)
-
-julia> isready(values, 2)
-false
+```@example lru
+isready(values, 2)
 ```
 
 `LRUMemoizedArray` retains at most `capacity` values and regenerates evicted ones.
@@ -52,14 +46,14 @@ false
 
 ![An expanding array map copies existing values into a larger grid and generates only the requested new value](assets/expanding-array-map.svg)
 
-```jldoctest
-julia> values = MemoizedArray(+, ExpandingArrayMap{Int}((3, 3); increment=2));
+```@example expanding
+using MemoizedArrays # hide
+values = MemoizedArray(+, ExpandingArrayMap{Int}((3, 3); increment=2));
+values[5, 2]
+```
 
-julia> values[5, 2]
-7
-
-julia> size(values)
-(5, 3)
+```@example expanding
+size(values)
 ```
 
 Growth applies only above the initial upper bounds. `increment` accepts one integer or one
@@ -69,41 +63,38 @@ integer per axis, such as `(2, 4)`.
 
 ![A radix lookup follows selected slots through branch arrays into a leaf array, with dots indicating further levels above](assets/radix-slots.svg)
 
-```jldoctest
-julia> values = MemoizedArray(tuple, RadixMap{Tuple{Int,Int}}(unbound(2); block_shape=(8, 8)));
-
-julia> values[-200, 300]
-(-200, 300)
+```@example radix
+using MemoizedArrays # hide
+values = MemoizedArray(tuple, RadixMap{Tuple{Int,Int}}(unbound(2); block_shape=(8, 8)));
+values[-200, 300]
 ```
 
 Use `SubtreeRadixMap` for a tree map whose requests cluster near zero:
 
-```jldoctest
-julia> values = MemoizedArray(tuple, SubtreeRadixMap{Tuple{Int,Int}}(unbound(2); block_shape=(8, 8)));
-
-julia> values[0, -1]
-(0, -1)
+```@example subtree
+using MemoizedArrays # hide
+values = MemoizedArray(tuple, SubtreeRadixMap{Tuple{Int,Int}}(unbound(2); block_shape=(8, 8)));
+values[0, -1]
 ```
 
 ## DictMap
 
-```jldoctest
-julia> values = LRUMemoizedArray(identity, DictMap{Int}(unbound(1)); capacity=512);
-
-julia> values[-20]
--20
+```@example dict
+using MemoizedArrays # hide
+values = LRUMemoizedArray(identity, DictMap{Int}(unbound(1)); capacity=512);
+values[-20]
 ```
 
 ## Indexing, views and generation
 
-```jldoctest
-julia> values = MemoizedArray(tuple, ArrayMap{Tuple{Int,Int}}((-3:3, 0:4)));
+```@example indexing
+using MemoizedArrays # hide
+values = MemoizedArray(tuple, ArrayMap{Tuple{Int,Int}}((-3:3, 0:4)));
+view(values, -2:2, 0:3)[1, 1]
+```
 
-julia> view(values, -2:2, 0:3)[1, 1]
-(-2, 0)
-
-julia> generate!(values, ((-3, 4), (3, 0))) === values
-true
+```@example indexing
+generate!(values, ((-3, 4), (3, 0))) === values
 ```
 
 Slices return ordinary arrays. A view generates only when it is read.
@@ -123,7 +114,12 @@ Concurrent requests for the same missing coordinate generate it once; other call
 
 ## Concurrent LRUMemoizedArray
 
-![Two queues reference one map entry; the last-access hint determines whether eviction drops only a queue reference or removes the map entry](assets/lru-queues.svg)
+The entry stores both the value and a `last_access` hint. Queues hold references to it.
+
+```@raw html
+<iframe src="assets/lru-animation.html" title="LRU access and eviction animation"
+    style="display:block; width:100%; height:440px; border:0; background:transparent;"></iframe>
+```
 
 ```julia
 values = LRUMemoizedArray(identity, ArrayMap{Int}((1000,));

@@ -63,38 +63,60 @@ def expanding_map():
 
 
 def lru_queues():
-    fig, ax = canvas(9, 7.3)
-    label(ax, 4.5, 6.95, "One map entry · multiple queue references", size=13)
+    fig, ax = canvas(6.6, 4.2)
+    label(ax, 1.15, 3.95, "Map slots", size=11)
     for row in range(2):
-        for column in range(5):
-            selected = (column, row) == (2, 0)
-            tile(ax, 2.75 + column * 0.7, 5.45 + row * 0.5, 0.7, 0.5,
-                 "A" if selected else "", BLUE if selected else GRID, selected)
-    label(ax, 4.5, 6.65, "A: last-access hint = Q2", BLUE, size=10)
-    for x, name, values in ((0.8, "Q1", ("A", "B", "C")),
-                            (5.3, "Q2", ("D", "E", "A"))):
-        label(ax, x + 1.4, 4.4, name, size=12)
+        for col in range(3):
+            name = (("D", "E", ""), ("B", "C", "A"))[row][col]
+            tile(ax, 0.55 + col * 0.4, 3.05 + (1-row) * 0.4,
+                 0.4, 0.4, name, BLUE if name == "A" else GRID, name == "A")
+    tile(ax, 3.05, 2.95, 3.05, 0.95, color=BLUE, selected=True)
+    label(ax, 4.575, 3.69, "Entry A: value = …", BLUE)
+    label(ax, 4.575, 3.37, "last_access: Q₂, version v", CENTRAL)
+    arrow(ax, (1.75, 3.25), (3.05, 3.25))
+    for x, name, values in ((0.5, "Q₁", ("A", "B", "C")),
+                            (4.05, "Q₂", ("D", "E", "A"))):
+        label(ax, x + 0.8, 2.48, name + " references", size=11)
         for i, value in enumerate(values):
-            tile(ax, x + i * 0.95, 3.4, 0.9, 0.55, value,
+            tile(ax, x + i * 0.55, 1.9, 0.4, 0.4, value,
                  BLUE if value == "A" else GRID, value == "A")
-        label(ax, x + 1.4, 3.05, "oldest → newest", size=10)
-        a_x = x + values.index("A") * 0.95 + 0.45
-        target_x = 4.3 if name == "Q1" else 4.7
-        ax.plot([a_x, a_x, target_x], [4.0, 4.85, 4.85], "--", color=BLUE, lw=1.5)
-        arrow(ax, (target_x, 4.85), (target_x, 5.45), dashed=True)
+        label(ax, x + 0.8, 1.68, "oldest → newest", size=10)
+        a_x = x + values.index("A") * 0.55 + 0.2
+        arrow(ax, (a_x, 2.3), (3.2 if name == "Q₁" else 5.9, 2.95), dashed=True)
+    label(ax, 3.3, 1.18, "Access timeline · left to right", size=11)
+    arrow(ax, (0.4, 0.78), (6.2, 0.78), GRID)
+    for x, queue, entry in ((0.8, "Q₁", "A"), (1.8, "Q₁", "B"),
+                            (2.8, "Q₁", "C"), (3.8, "Q₂", "D"),
+                            (4.8, "Q₂", "E"), (5.8, "Q₂", "A")):
+        ax.plot(x, 0.78, "o", color=BLUE if entry == "A" else GRID, markersize=4)
+        label(ax, x, 0.48, queue + ": " + entry, size=10)
+    label(ax, 3.3, 0.14, "Final access to A stamps Q₂; Q₁'s ordering stays unchanged.", size=10)
+    save(fig, "lru-queues.svg", "Square map slots and small queue references share entry A; the timeline explains each queue's order and A's last-access hint")
 
-    for x, title, detail, result, color in (
-            (0.35, "Q1 reaches A", "Last access belongs to Q2", "Drop Q1 reference\nKeep A in the map", CENTRAL),
-            (4.85, "Later, Q2 reaches A", "Still last accessed by Q2", "Remove A from the map\nReuse its entry", BLUE)):
-        arrow(ax, (x + 1.9, 2.8), (x + 1.9, 2.45), color)
-        tile(ax, x, 0.65, 3.8, 1.75, color=color, selected=True)
-        label(ax, x + 1.9, 2.1, title, color, size=12)
-        label(ax, x + 1.9, 1.7, detail, size=10)
-        label(ax, x + 1.9, 1.15, result, color, size=11)
-    label(ax, 4.5, 0.2, "Removal also requires the same live entry version and a successful exclusive claim.", size=10)
-    save(fig, "lru-queues.svg", "Queues reference shared entries; last-access hints distinguish dropping a membership from removing a map entry")
+
+def lru_eviction():
+    fig, ax = canvas(6.6, 4.8)
+    def box(y, text, color=BLUE):
+        tile(ax, 0.1, y, 3.8, 0.55, text, color, True)
+    box(4.1, "Q₁ selects its oldest reference")
+    box(3.25, "Same live entry version?")
+    box(2.4, "Current-version hint\nnames another queue?")
+    box(1.55, "Exclusive claim succeeds?")
+    box(0.55, "Remove map entry\nReuse or release it", CENTRAL)
+    for top, bottom, text in ((4.1, 3.8, ""), (3.25, 2.95, "Yes"),
+                              (2.4, 2.1, "No"), (1.55, 1.1, "Yes")):
+        arrow(ax, (2, top), (2, bottom))
+        label(ax, 2.35, (top + bottom) / 2, text, size=10)
+    tile(ax, 4.65, 2.25, 1.85, 0.9, "Drop only Q₁'s\nreference\nKeep map as is", CENTRAL, True)
+    for y, answer in ((3.525, "No"), (2.675, "Yes"), (1.825, "No")):
+        ax.plot([3.9, 4.4, 4.4], [y, y, 2.7], color=CENTRAL, lw=1.3)
+        label(ax, 4.15, y + 0.15, answer, CENTRAL, size=10)
+    arrow(ax, (4.4, 2.7), (4.65, 2.7), CENTRAL)
+    label(ax, 3.3, 0.2, "Reusing an entry changes its version; old references become stale.", size=10)
+    save(fig, "lru-eviction.svg", "Compact eviction flow checks version, last-access hint and exclusive claim")
 
 
 if __name__ == "__main__":
     expanding_map()
     lru_queues()
+    lru_eviction()
