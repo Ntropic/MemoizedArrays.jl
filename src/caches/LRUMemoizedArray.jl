@@ -6,6 +6,8 @@ Generate values on demand with bounded retention. Capacity must be positive and 
 Serial access uses one exact LRU queue. Concurrent access uses queue handles;
 queues default to `Threads.nthreads(:default)` and their positive count must divide capacity.
 Ordering is exact within each queue and approximate across queues.
+Manual assignment creates a pinned entry outside the pool and capacity; pinned reads
+skip queue updates. Concurrent assignment uses a queue handle.
 """
 struct LRUMemoizedArray{V,N,M,G,D,Q,Concurrent} <: AbstractMemoizedArray{V,N,M}
     map::M
@@ -63,6 +65,7 @@ resident_count(queue::SerialLRUQueue) = queue.count
     if slot !== nothing
         stored = slot_entry(slot)
         if stored !== cache.map.empty
+            stored.explicit && return stored.value
             queue_touch!(cache.eviction, stored.id)
             return stored.value
         end
@@ -72,6 +75,8 @@ resident_count(queue::SerialLRUQueue) = queue.count
     # Nested generation/conversion may have grown storage. Reserve its current
     # destination before changing the queue; failed growth must not evict a value.
     slot = reserve!(cache.map, key, routing, slot, hint)
+    existing = slot_entry(slot)
+    existing !== cache.map.empty && existing.explicit && return existing.value
     stored = serial_insert!(cache, cache.eviction, key, value)
     slot_publish!(slot, stored)
     return value
@@ -80,6 +85,7 @@ end
 @inline function cache_get(cache::LRUMemoizedArray{V,N,M}, lookup, indices::Tuple) where {V,N,M<:LRUDictMap}
     key, hashed, stored, hint = lookup
     if stored !== nothing
+        stored.explicit && return stored.value
         queue_touch!(cache.eviction, stored.id)
         return stored.value
     end
@@ -94,6 +100,7 @@ end
     if slot !== nothing
         stored = prepared_entry(slot, hint)
         if stored !== cache.map.empty
+            stored.explicit && return stored.value
             queue_touch!(cache.eviction, stored.id)
             return stored.value
         end
@@ -104,6 +111,7 @@ end
     stored = slot_entry(slot)
     if stored !== cache.map.empty
         # A nested generator or conversion may have completed this key already.
+        stored.explicit && return stored.value
         stored.value = value
         queue_touch!(cache.eviction, stored.id)
         return value
@@ -249,6 +257,7 @@ end
 
 @inline function private_get(cache::LRUMemoizedArray{V},q,ref,key,indices,stored=slot_entry(ref),allocation=nothing) where V
     if stored isa managed_stored_type(V,q)
+        stored.explicit && return decode_value(V, (@atomic :acquire stored.value))::V
         index = @inbounds memoryref(q.positions,stored.id)[]
         if index != 0
             # A fresh slot load follows this queue's earlier validated access.
@@ -358,6 +367,7 @@ end
             stored = slot_entry(ref)
             continue
         elseif stored isa managed_stored_type(V,q)
+            stored.explicit && return decode_value(V, (@atomic :acquire stored.value))::V
             valid,value,version = private_snapshot(stored,key)
             if valid
                 private_remember!(cache,q,stored,version)
@@ -366,5 +376,85 @@ end
         end
         yield()
         stored = slot_entry(ref)
+    end
+end
+
+
+# Conversion precedes lookup: user-defined conversion may itself access the cache.
+Base.@propagate_inbounds function Base.setindex!(cache::LRUMemoizedArray{V,N,M,G,D,Q,false}, value,
+    indices::Vararg{Int,N}) where {V,N,M,G,D,Q}
+    value = value isa V ? value : (convert(V,value)::V)
+    return cache_set!(cache,value,map_lookup(cache,indices))
+end
+
+Base.@propagate_inbounds Base.setindex!(cache::LRUMemoizedArray, value, key::CartesianIndex) =
+    setindex!(cache,value,Tuple(key)...)
+
+function cache_set!(cache::LRUMemoizedArray, value, lookup)
+    key,routing,slot,hint = lookup
+    stored = typeof(cache.map.empty)(UInt32(0),true)
+    stored.key = key
+    stored.value = value
+    slot = reserve!(cache.map,key,routing,slot,hint)
+    previous = slot_entry(slot)
+    if previous === cache.map.empty
+        map_retain!(cache.map,slot)
+    elseif !previous.explicit
+        queue_unlink!(cache.eviction,previous.id)
+    end
+    slot_publish!(slot,stored)
+    return value
+end
+
+function cache_set!(cache::LRUMemoizedArray{V,N,M}, value, lookup) where {V,N,M<:LRUDictMap}
+    return dict_lru_set!(cache,value,lookup)
+end
+
+Base.@propagate_inbounds function Base.setindex!(handle::QueueHandle{V,N}, value,
+    indices::Vararg{Int,N}) where {V,N}
+    value = value isa V ? value : (convert(V,value)::V)
+    key,routing,reference,hint = map_lookup(handle,indices)
+    slot = assignment_slot(handle.cache.map,key,routing,reference,hint)
+    return private_set!(handle.cache,handle.queue,slot,key,value)
+end
+
+Base.@propagate_inbounds Base.setindex!(handle::QueueHandle, value, key::CartesianIndex) =
+    setindex!(handle,value,Tuple(key)...)
+
+function private_set!(cache::LRUMemoizedArray{V},q,slot,key,value) where V
+    S = concurrent_value_type(V)
+    entry = managed_stored_type(V,q)(true,UInt32(0),UInt64(0),UInt64(0),key,encode_value(V,value))
+    while true
+        previous = slot_entry(slot)
+        if previous === GENERATING
+            pending = GenerateWait{S}()
+            claim = claim_slot!(cache.map,key,slot,GENERATING,pending)
+            slot = claimed_slot(slot,claim)
+            claim.success && wait_generated(V,pending.reference)
+        elseif previous isa GenerateWait{S}
+            wait_generated(V,previous.reference)
+        elseif previous isa managed_stored_type(V,q) && !previous.explicit
+            valid,_,version = private_snapshot(previous,key)
+            if valid
+                owned = @atomicreplace :acquire_release :acquire previous.state version => (version | 1)
+                if owned.success
+                    claim = claim_slot!(cache.map,key,slot,previous,entry)
+                    slot = claimed_slot(slot,claim)
+                    if claim.success
+                        # Other queues keep their references; incarnation checks reject them.
+                        index = @inbounds memoryref(q.positions,previous.id)[]
+                        index != 0 && private_unlink!(q,index)
+                        private_free!(q,previous,version)
+                        return value
+                    end
+                    @atomic :release previous.state = version
+                end
+            end
+        else
+            claim = claim_slot!(cache.map,key,slot,previous,entry)
+            slot = claimed_slot(slot,claim)
+            claim.success && return value
+        end
+        yield()
     end
 end

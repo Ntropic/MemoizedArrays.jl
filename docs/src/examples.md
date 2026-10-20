@@ -6,7 +6,7 @@ CurrentModule = MemoizedArrays
 
 
 ## MemoizedArray
-In the simplest case we define a  generate a conventional array via `ArrayMap`
+In the simplest case we can use conventional arrays via `ArrayMap`
 ```@example basic
 using MemoizedArrays # hide
 generator(i, j) = i + j;
@@ -15,7 +15,7 @@ values[2, 3]
 ```
 `MemoizedArray` stores any generated values - it does not evict old and unused values. Use `ArrayMap` for a fixed finite domain.
 
-The generator can be selfreferential, requesting values of the array it constructs, by using the `do` syntax 
+The `do` syntax in combination with explicit value declarations allows for generators that reference other array values 
 
 ```@example recursive
 using MemoizedArrays # hide
@@ -26,9 +26,8 @@ values[1] = 1;
 values[8]
 ```
 
-Dependencies must be acyclic: a generator cannot request its own unfinished value.
-
 ## LRUMemoizedArray
+`LRUMemoizedArray` retains at most `capacity` generated values, to balance generation cost with memory utilisation. 
 
 ```@example lru
 using MemoizedArrays # hide
@@ -40,10 +39,24 @@ values[1], values[2], values[1], values[3]
 isready(values, 2)
 ```
 
-`LRUMemoizedArray` retains at most `capacity` values and regenerates evicted ones.
+### Pinned starting values
+
+```@example pinned
+using MemoizedArrays # hide
+values = LRUMemoizedArray(ArrayMap{Int}((8,)); capacity=2) do i
+    values[i - 1] + 1
+end;
+values[1] = 1;
+values[8], values[1]
+```
+
+- Manual assignments create fresh pinned entries outside the pool and `capacity`.
+- Overwrites release the old pooled entry for reuse. Pinned reads skip queue updates.
+- Concurrent assignments use a queue handle: `handle[1] = 1`.
+- Generator dependencies must be acyclic.
 
 ## ExpandingArrayMap
-
+Expanding arrays grow incrementally to allow requests beyond existing array bounds.  
 ![An expanding array map copies existing values into a larger grid and generates only the requested new value](assets/expanding-array-map.svg)
 
 ```@example expanding
@@ -56,11 +69,8 @@ values[5, 2]
 size(values)
 ```
 
-Growth applies only above the initial upper bounds. `increment` accepts one integer or one
-integer per axis, such as `(2, 4)`.
-
 ## RadixMap
-
+Sparse data can be stored via `RadixMap`, via an expanding radix tree, to 
 ![A radix lookup follows selected slots through branch arrays into a leaf array, with dots indicating further levels above](assets/radix-slots.svg)
 
 ```@example radix

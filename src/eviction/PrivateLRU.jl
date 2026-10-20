@@ -2,6 +2,7 @@
 # State: incarnation in the high bits; low bits 0 = live, 1 = editing, 2 = free.
 # Last access: the same incarnation plus queue number, used only as a recency hint.
 mutable struct SharedLRUEntry{S,K}
+    const explicit::Bool
     const id::UInt32
     @atomic state::UInt64
     @atomic last_access::UInt64
@@ -32,7 +33,7 @@ end
 
 function PrivateLRUQueue(::Type{E}, key, number, quota, capacity, queues) where E
     step = UInt64(nextpow(2,max(4,queues+1)))
-    pool = [E(UInt32((number-1)*quota+i),2,0,key,EMPTY) for i in 1:quota]
+    pool = [E(false,UInt32((number-1)*quota+i),2,0,key,EMPTY) for i in 1:quota]
     links = Memory{UInt32}(undef,2quota)
     fill!(links,0)
     for i in 1:quota
@@ -66,7 +67,7 @@ end
 end
 
 # Remove only local membership; the vacated link becomes the local free-index list.
-@inline function private_unlink!(q,index)
+@inline function queue_unlink!(q,index)
     @inbounds begin
         previous,next = memoryref(q.links,2Int(index)-1)[],memoryref(q.links,2Int(index))[]
         if q.count == 1
@@ -81,13 +82,17 @@ end
             memoryref(q.links,2Int(previous))[] = next
             memoryref(q.links,2Int(next)-1)[] = previous
         end
-        memoryref(q.positions,q.entries[index].id)[] = 0
         memoryref(q.links,2Int(index)-1)[] = 0
         memoryref(q.links,2Int(index))[] = q.vacant
         q.vacant = index
         q.count -= 1
     end
     return nothing
+end
+
+@inline function private_unlink!(q,index)
+    @inbounds memoryref(q.positions,q.entries[index].id)[] = 0
+    return queue_unlink!(q,index)
 end
 
 # No reader lock. Both payload fields are atomic, and their release/acquire

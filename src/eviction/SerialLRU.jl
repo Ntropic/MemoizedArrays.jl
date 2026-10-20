@@ -1,9 +1,10 @@
 # A serial entry's permanent ID is its local link position.
 mutable struct SerialLRUEntry{V,K}
+    const explicit::Bool
     const id::UInt32
     key::K
     value::V
-    SerialLRUEntry{V,K}(id::UInt32) where {V,K} = new{V,K}(id)
+    SerialLRUEntry{V,K}(id::UInt32, explicit::Bool=false) where {V,K} = new{V,K}(explicit,id)
 end
 
 mutable struct SerialLRUQueue{E}
@@ -13,12 +14,16 @@ mutable struct SerialLRUQueue{E}
     const links::MemoryRef{UInt32}
     oldest::UInt32
     newest::UInt32
+    vacant::UInt32
 end
 
 function SerialLRUQueue(::Type{E}, capacity) where E
     entries = [E(UInt32(i)) for i in 1:capacity]
     links = memoryref(Memory{UInt32}(undef, 2capacity))
-    return SerialLRUQueue{E}(capacity, 0, entries, links, 0, 0)
+    for i in 1:capacity
+        memoryref(links, 2i)[] = UInt32(i == capacity ? 0 : i + 1)
+    end
+    return SerialLRUQueue{E}(capacity, 0, entries, links, 0, 0, 1)
 end
 
 function map_entry(::Type{SerialLRUEntry}, ::Type{V}, Key, _) where V
@@ -37,7 +42,8 @@ end
         stored.value = value
         queue_touch!(q, index)
     else
-        index = UInt32(q.count + 1)
+        index = q.vacant
+        q.vacant = @inbounds memoryref(q.links, 2Int(index))[]
         stored = @inbounds q.entries[index]
         stored.key = key
         stored.value = value

@@ -213,3 +213,9 @@ function remove_mapping!(store::ConcurrentDictMap, entry)
 end
 
 queue_key(::ConcurrentDictMap{T,N}) where {T,N} = ntuple(_ -> 0, Val(N))
+
+
+function assignment_slot(map::ConcurrentDictMap,key,hashed,record,hint)
+    record === nothing && (record = map_reserve!(map,key,hashed))
+    return DictSlot(map,record)
+end

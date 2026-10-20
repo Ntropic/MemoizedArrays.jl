@@ -139,3 +139,6 @@ end
 @inline remove_mapping!(map::ConcurrentArrayMap, entry) =
     slot_publish!(map_slot(map, (@atomic :acquire entry.key), nothing), EMPTY)
 queue_key(::ConcurrentArrayMap) = 0
+
+
+@inline assignment_slot(::ConcurrentArrayMap,key,routing,reference,hint) = reference

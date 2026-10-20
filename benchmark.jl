@@ -101,6 +101,10 @@ function touch_empty!(reader,keys)
             q.entries[i]=entry
         end
         fill!(q.links.mem,0)
+        for i in 1:q.capacity
+            q.links.mem[2i]=UInt32(i==q.capacity ? 0 : i+1)
+        end
+        q.vacant=UInt32(1)
         q.oldest=q.newest=UInt32(0)
         q.count=0
     end

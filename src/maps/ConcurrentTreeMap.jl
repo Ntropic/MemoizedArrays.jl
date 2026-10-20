@@ -455,3 +455,9 @@ function detach_leaf!(store::ConcurrentTreeMap{T,N}, link, leaf) where {T,N}
 end
 
 queue_key(::ConcurrentTreeMap{T,N}) where {T,N} = ntuple(_ -> 0, Val(N))
+
+
+function assignment_slot(map::ConcurrentTreeMap,key,routing,reference,leaf)
+    reference === nothing && return map_reserve!(map,key,routing,Val(true))
+    return ConcurrentLeafSlot(leaf,reference)
+end

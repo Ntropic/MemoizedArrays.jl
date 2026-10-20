@@ -39,7 +39,12 @@ end
         @test handle[1, 6] == 61
         @test_throws BoundsError handle[-3, 4]
         @test_throws ArgumentError handle[13]
-        @test_throws Base.CanonicalIndexError (handle[-2, 4] = 0)
+        if C === LRUMemoizedArray
+            handle[-2,4] = 0
+            @test handle[-2,4] == 0
+        else
+            @test_throws Base.CanonicalIndexError (handle[-2,4] = 0)
+        end
         scalar = concurrent_test_cache(C, Int, () -> 9, (); map_factory)
         @test concurrent_test_handle(scalar, 1)[] == 9
         @test isempty(concurrent_test_cache(C, Int, identity, (0,); map_factory))

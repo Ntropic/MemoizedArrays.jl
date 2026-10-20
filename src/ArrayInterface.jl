@@ -44,6 +44,10 @@ Base.@propagate_inbounds function cache_get(cache::AbstractMemoizedArray{V}, ind
     return cache_get(cache, lookup, indices)::V
 end
 Base.@propagate_inbounds Base.getindex(cache::AbstractMemoizedArray, key::CartesianIndex) = cache[Tuple(key)...]
+# Prevent AbstractArray's linear-assignment fallback; supported setters require
+# exactly one coordinate per dimension.
+Base.setindex!(cache::AbstractMemoizedArray, value, indices::Vararg{Int}) =
+    throw(Base.CanonicalIndexError("setindex!",typeof(cache)))
 Base.@propagate_inbounds function Base.getindex(cache::AbstractMemoizedArray{V,N}, indices...) where {V,N}
     length(indices) == N || throw(ArgumentError("supply one index per cache dimension; linear indexing is unsupported"))
     return array_index(cache, to_indices(cache, indices))

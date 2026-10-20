@@ -327,3 +327,5 @@ include("ConcurrentTreeLRU_test.jl")
 include("MultiQueue_test.jl")
 include("ConcurrentExpandingLRU_test.jl")
 include("DictCaches_test.jl")
+
+include("PinnedEntries_test.jl")

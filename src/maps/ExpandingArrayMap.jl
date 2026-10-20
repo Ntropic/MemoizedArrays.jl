@@ -409,3 +409,12 @@ end
     ref = allocation_contains(allocation, key) ? allocation_slot(allocation, key) : nothing
     return key, allocation, ref, nothing
 end
+
+
+function assignment_slot(map::ConcurrentExpandingArrayMap,key,allocation,reference,hint)
+    if reference === nothing
+        allocation = grow_allocation!(map,key)
+        reference = allocation_slot(allocation,key)
+    end
+    return ExpandingSlot(map,allocation,reference,key)
+end

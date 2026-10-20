@@ -103,6 +103,7 @@ end
         entry, address = hash_find(table, key, hashed)
     end
     if entry !== nothing
+        entry.explicit && return entry.value
         entry.value = value
         queue_touch!(cache.eviction, entry.id)
         return value
@@ -127,5 +128,29 @@ end
     if previous === HASH_EMPTY
         store.used += 1
     end
+    return value
+end
+
+
+function dict_lru_set!(cache,value,lookup)
+    key,hashed,previous,hint = lookup
+    store = cache.map
+    table,address,_ = hint
+    if previous === nothing && table[address] === HASH_EMPTY && store.used + 1 > 3(length(table) ÷ 4)
+        count = store.count + 1 > 3(length(table) ÷ 4) ? Base.checked_mul(length(table),4) : length(table)
+        table = hash_rebuild!(store,count)
+        _,address = hash_find(table,key,hashed)
+    end
+    stored = typeof(store.empty)(UInt32(0),true)
+    stored.key = DictLocation(key,hashed,address)
+    stored.value = value
+    if previous === nothing
+        store.count += 1
+        table[address] === HASH_EMPTY && (store.used += 1)
+    elseif !previous.explicit
+        queue_unlink!(cache.eviction,previous.id)
+    end
+    table[address] = stored
+    store.insertions += UInt(1)
     return value
 end
