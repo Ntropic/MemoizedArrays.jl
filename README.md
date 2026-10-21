@@ -84,20 +84,6 @@ end
 ```
 Do not mix automatic selection with explicit handles concurrently on the same cache.
 
-## Development
+## Author
 
-Run the test suite with `julia --project=. -t 8 test/runtests.jl`.
-`test/Behavior_test.jl` checks shared behavior across maps and cache modes;
-`test/Concurrency_test.jl` holds focused race regressions. Shared fixtures and
-allocation probes live in `test/helpers.jl`.
-Focused implementation tests live in `test/internal/`: coordinate mapping,
-growth and relocation, LRU bookkeeping, tree pruning, and dictionary collisions.
-Concurrency regressions retain the explicit scheduling needed to reproduce races.
-
-CI builds the documentation on every run and publishes successful `main` builds
-to `/stable/`. Enable **Settings → Pages → Source → GitHub Actions** once for the
-repository. Pull requests build the docs without publishing them.
-
-Run benchmarks with `julia --project=. -t 8 benchmark.jl`. See
-[benchmark workloads and options](docs/src/benchmarks.md#reproduce-the-results)
-for selecting cases and operations.
+Michael Schilling
