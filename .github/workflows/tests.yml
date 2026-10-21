@@ -1,4 +1,4 @@
-name: Tests
+name: Tests and documentation
 
 on: [push, pull_request, workflow_dispatch]
 
@@ -11,8 +11,20 @@ jobs:
     env:
       JULIA_NUM_THREADS: '8'
     steps:
-      - uses: actions/checkout@v4
-      - uses: julia-actions/setup-julia@v2
+      - uses: actions/checkout@v7
+      - uses: julia-actions/setup-julia@v3
         with:
-          version: '1.12'
+          version: '1.13'
       - uses: julia-actions/julia-runtest@v1
+
+  docs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: julia-actions/setup-julia@v3
+        with:
+          version: '1.13'
+      - name: Install documentation dependencies
+        run: julia --project=docs -e 'using Pkg; Pkg.instantiate()'
+      - name: Build documentation
+        run: julia --project=docs docs/make.jl

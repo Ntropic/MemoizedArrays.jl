@@ -1,9 +1,9 @@
 # MemoizedArrays.jl
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue)](LICENSE)
-[![Julia 1.12+](https://img.shields.io/badge/Julia-1.12%2B-9558B2)](https://julialang.org/downloads/)
-[![Documentation](https://img.shields.io/badge/docs-online-blue)](https://ntropic.github.io/MemoizedArrays.jl/)
-[![Tests](https://img.shields.io/github/actions/workflow/status/Ntropic/MemoizedArrays.jl/tests.yml?label=tests&logo=githubactions&logoColor=white)](https://github.com/Ntropic/MemoizedArrays.jl/actions/workflows/tests.yml)
+[![Julia 1.13+](https://img.shields.io/badge/Julia-1.13%2B-9558B2)](https://julialang.org/downloads/)
+[![Documentation](docs/src/assets/docs-badge.svg)](docs/src/index.md)
+[![Tests and documentation](https://github.com/Ntropic/MemoizedArrays.jl/actions/workflows/tests.yml/badge.svg?branch=main)](https://github.com/Ntropic/MemoizedArrays.jl/actions/workflows/tests.yml)
 
 **Compute array elements when you need them, and reuse the results.**
 
