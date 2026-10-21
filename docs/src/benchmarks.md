@@ -154,7 +154,9 @@ patterns. Regenerate the transparent SVGs with `python docs/plot_tree_sampling.p
 
 ### Reproduce the results
 
-The single harness defaults to fixed ArrayMap. Select other cases through `QUEUE_CASES`:
+The entry point `benchmark.jl` handles workers, timing and reporting;
+`benchmark/workloads.jl` defines cache setup and requests. The harness defaults to
+fixed ArrayMap. Select other cases through `QUEUE_CASES`:
 
 ```sh
 julia --startup-file=no --compiled-modules=existing --project=. -t 8 benchmark.jl
@@ -171,6 +173,10 @@ Use `QUEUE_READ_PATTERN=varying` for precomputed uniform reads with replacement;
 cycles a fixed shuffled sequence. Use `QUEUE_OPERATIONS=read` (trees: `read-central,read-spread`)
 to measure only reads. `QUEUE_ROUNDS=15` and `QUEUE_CALLERS=1,8` are defaults.
 For serial/one-caller checks on fewer threads, set `QUEUE_CALLERS=1`.
+Eviction workloads share `QUEUE_CAPACITY` (resident capacity, default 8192) and
+`QUEUE_EVICT_COUNT` (requests, default 32768), including `evict-spread` for trees.
+`QUEUE_TREE_EVICT_CAPACITY` has been removed; use `QUEUE_CAPACITY` instead.
+Central tree batches retain their fixed 512-entry geometry.
 
 Recorded runs: Julia 1.13.0, Ryzen 9 7950X, 2026-10-09, 15 rotated rounds.
 Linux affinity: `QUEUE_PIN=true QUEUE_CPU_OFFSET=8 QUEUE_PRODUCER_CPU=0` puts callers on

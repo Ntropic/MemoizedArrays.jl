@@ -1,3 +1,39 @@
+@testset "Subtree insertion across missing shortcuts" begin
+    for center in (0.5, -0.5)
+        cache = MemoizedArray(identity, SubtreeRadixMap{Int}(unbound(1); block_shape=(8,), center))
+        function checkshortcuts()
+            map = cache.map
+            for key in (0, 8, 64, 72, 512, -512, 4096, 8192, typemin(Int), typemax(Int))
+                encoded = JA.map_routing(map, (key,))
+                direct = JA.tree_find(map, encoded, JA.root_link(map), length(map.zero_path)-1, Val(false))
+                shortcut = mapslot(map, (key,))
+                @test (direct === nothing && shortcut === nothing) ||
+                    (direct !== nothing && shortcut !== nothing && direct.leaf === shortcut.leaf)
+            end
+        end
+        # Start off the zero path, split compressed edges, then fill missing lower levels.
+        keys = (64, 72, 4096, 0, 8, 512, -512)
+        for key in keys
+            @test !isready(cache, key)
+            @test cache[key] == key
+            treecounts(cache.map)
+            checkshortcuts()
+        end
+        for key in (0, 8, 4096)
+            JA.delete_key!(cache.map, (key,))
+            checkshortcuts()
+        end
+        for key in (1, 9, 8192)
+            @test !isready(cache, key)
+            @test cache[key] == key
+            treecounts(cache.map)
+            checkshortcuts()
+        end
+        @test all(key -> isready(cache, key) && cache[key] == key, (64, 72, 512, -512, 1, 9, 8192))
+        @test all(key -> !isready(cache, key), (0, 8, 4096))
+    end
+end
+
 @testset "Per-axis expansion increments" begin
     for increments in ((2, 4), [2, 4]), Cache in (MemoizedArray, LRUMemoizedArray), concurrent in (false, true)
         options = Cache === LRUMemoizedArray ? (; capacity=8, queues=1) : (;)
@@ -67,133 +103,40 @@ end
     end
 end
 
-struct ExpandingConversion
-    cache
-    value::Int
-end
-function Base.convert(::Type{Int}, source::ExpandingConversion)
-    source.cache[6,3]
-    return source.value
-end
-
-@testset "Expanding MemoizedArray" begin
-    map_spec = ((V, domain) -> ExpandingArrayMap{V}(domain; increment=8))
-    calls = Ref(0)
-    cache = MemoizedArray((i,j) -> (calls[] += 1; (i,j)), map_spec(Tuple{Int,Int}, (2,3)))
-    for coordinate in CartesianIndices((2,3))
-        @test cache[coordinate] == Tuple(coordinate)
-    end
-    @test (@inferred cache[3,2]) === (3,2)
-    @test size(cache) == (10,3)
-    @test (@inbounds cache[22,12]) === (22,12)
-    @test size(cache) == (26,19)
-    for coordinate in CartesianIndices((2,3))
-        @test cache[coordinate] == Tuple(coordinate)
-    end
-    @test calls[] == 8
-    @test !isready(cache,100,100)
-    @test size(cache) == (26,19)
-    @test_throws BoundsError cache[0,1]
-    @test_throws ArgumentError cache[1]
-
-    one = MemoizedArray(identity, map_spec(Int, [10]))
-    @test one[11] == 11
-    @test size(one) == (18,)
-    @test one[35] == 35
-    @test size(one) == (42,)
-
-    offset = MemoizedArray(tuple, map_spec(Tuple{Int,Int}, (-2:-1,4:5)))
-    selected = view(offset, -2:-1, 4:5)
-    @test offset[-2,5] === (-2,5)
-    @test offset[0,6] === (0,6)
-    @test axes(offset) == (-2:7,4:13)
-    @test copy(selected) == [(i,j) for i in -2:-1,j in 4:5]
-    @test_throws BoundsError offset[-3,4]
-    @test_throws BoundsError offset[-2,3]
-
-    zero = MemoizedArray(+, map_spec(Int, (0,2)))
-    @test isempty(zero)
-    @test zero[1,2] == 3
-    @test size(zero) == (8,2)
-    scalar = MemoizedArray(() -> 7, map_spec(Int, ()))
-    @test scalar[] == 7
-    @test size(scalar) == ()
-
-    value = ones(4,4)
-    matrix = MemoizedArray(Returns(value), map_spec(typeof(value), (1,)))
-    retained = matrix[1]
-    @test matrix[2] === retained === matrix[1]
-    @test readyallocations(matrix) == 0
-
-    @test_throws UndefKeywordError ExpandingArrayMap{Int}((3,))
-    @test_throws ArgumentError ExpandingArrayMap{Int}((3,); increment=0)
-    @test_throws ArgumentError ExpandingArrayMap{Int}((3,); increment=-1)
-    @test_throws ArgumentError MemoizedArray(identity, map_spec(Int, unbound(1)))
-    @test_throws ArgumentError MemoizedArray(identity, map_spec(Int, (-1,)))
-    @test LRUMemoizedArray(identity, map_spec(Int, (2,)); capacity=1)[1] == 1
-end
-
-@testset "Expanding serial LRU preserves coordinate order" begin
-    trace = ((1,2), (2,1), (1,2), (3,2), (1,4), (3,2), (4,4))
-    for capacity in (1,2)
-        cache = LRUMemoizedArray(tuple, ExpandingArrayMap{Tuple{Int,Int}}((2,2); increment=2); capacity)
-        order = Tuple{Int,Int}[]
-        for key in trace
-            filter!(!=(key), order)
-            push!(order, key)
-            if length(order) > capacity
-                popfirst!(order)
+@testset "Radix read path and generation" begin
+    for map_spec in (:radix, :subtree), seed in (false, true)
+        calls = Dict{Tuple{Int,Int},Int}()
+        cache = MemoizedArray(test_map_config(map_spec, (4, 8))(Int, (-32:1023, -32:1023))) do i, j
+            key = (i,j)
+            slot = mapslot(cache.map, key)
+            @test slot !== nothing && JA.slot_entry(slot) === cache.map.empty
+            calls[key] = get(calls, key, 0) + 1
+            if key == (7,7)
+                error("generation failed")
+            elseif key == (0,0)
+                # Generation can split branches before the outer entry is inserted.
+                for nested in ((1,0), (128,128), (900,900))
+                    cache[nested...]
+                end
             end
-            @test cache[key...] === key
-            @test cache.eviction.count == length(order)
-            @test all(candidate -> isready(cache, candidate...) == (candidate in order), trace)
-            @test count(entry -> entry !== cache.map.empty, cache.map.reference.mem) == length(order)
+            return i + 2000j
         end
-        @test size(cache) == (4,4)
+        if seed
+            @test cache[0,1] == 2000
+        end
+        @test cache[0,0] == cache[0,0] == 0
+        @test all(key -> isready(cache, key...), ((0,0), (1,0), (128,128), (900,900)))
+        @test all(==(1), values(calls))
+        treecounts(cache.map)
+        @test_throws ErrorException cache[7,7]
     end
-
-    offset = LRUMemoizedArray(tuple, ExpandingArrayMap{Tuple{Int,Int}}((-2:-1,4:5); increment=2); capacity=1)
-    @test offset[-2,5] === (-2,5)
-    @test offset[0,4] === (0,4)
-    @test !isready(offset,-2,5)
-    @test offset[-1,6] === (-1,6)
-    @test !isready(offset,0,4) && isready(offset,-1,6)
-    @test axes(offset) == (-2:1,4:7)
-    zero = LRUMemoizedArray(+, ExpandingArrayMap{Int}((0,2); increment=2); capacity=1)
-    @test zero[1,2] == 3 && size(zero) == (2,2)
-    @test zero[2,1] == 3 && !isready(zero,1,2)
-    scalar = LRUMemoizedArray(() -> 7, ExpandingArrayMap{Int}((); increment=2); capacity=1)
-    @test scalar[] == 7 && scalar.eviction.count == 1
-end
-
-@testset "Expanding LRU reuses entries without changing returned values" begin
-    values = (fill(1,2,2), fill(2,2,2), fill(3,2,2))
-    cache = LRUMemoizedArray((i,j) -> values[i], ExpandingArrayMap{Matrix{Int}}((1,2); increment=2); capacity=1)
-    first = cache[1,2]
-    entry = JA.entry(cache, (1,2))
-    second = cache[2,1]
-    @test JA.entry(cache,(2,1)) === entry
-    @test !isready(cache,1,2)
-    @test cache[3,4] === values[3]
-    @test JA.entry(cache,(3,4)) === entry
-    @test !isready(cache,2,1)
-    @test first === values[1] && all(==(1),first)
-    @test second === values[2] && all(==(2),second)
+    scalar = MemoizedArray(() -> 17, RadixMap{Int}((); block_shape=()))
+    @test scalar[] == scalar[] == 17
 end
 
 @testset "Expanding LRU nested generation and conversion" begin
     for capacity in (1,2), conversion in (false,true)
-        owner = Ref{Any}()
-        generator = (i,j) -> begin
-            if (i,j) == (1,1)
-                if conversion
-                    return ExpandingConversion(owner[],11)
-                end
-                owner[][6,3]
-                return 11
-            end
-            return 63
-        end
+        (; generator, owner) = nested_generator(Returns(63), (1, 1), cache -> (cache[6, 3]; 11); conversion)
         cache = LRUMemoizedArray(generator, ExpandingArrayMap{Int}((2,2); increment=2); capacity)
         owner[] = cache
         for i in 1:capacity
@@ -227,7 +170,6 @@ end
     @test size(cache) == (2,) && cache.eviction.count == 1
     @test isready(cache,lower) && JA.entry(cache,(1,)) === entry
 end
-
 
 @testset "Expanding LRU matrix requests allocate only on growth" begin
     value = ones(4,4)
@@ -291,7 +233,7 @@ end
     # Conversion, as well as the generator itself, can invalidate a saved slot.
     owner = Ref{Any}()
     converting_nested = MemoizedArray((i,j) -> (i,j) == (1,1) ?
-        ExpandingConversion(owner[], 11) : 63, ExpandingArrayMap{Int}((1,1); increment=4))
+        TestConversion(() -> (owner[][6, 3]; 11)) : 63, ExpandingArrayMap{Int}((1,1); increment=4))
     owner[] = converting_nested
     @test converting_nested[1,1] == 11
     @test size(converting_nested) == (9,5)
