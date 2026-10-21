@@ -1,4 +1,4 @@
-name: Tests and documentation
+name: Tests
 
 on: [push, pull_request, workflow_dispatch]
 
@@ -28,3 +28,34 @@ jobs:
         run: julia --project=docs -e 'using Pkg; Pkg.instantiate()'
       - name: Build documentation
         run: julia --project=docs docs/make.jl
+      - name: Stage documentation site
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        run: |
+          mkdir -p "$RUNNER_TEMP/pages"
+          cp -R docs/build "$RUNNER_TEMP/pages/stable"
+          printf '%s\n' 'var DOCUMENTER_CURRENT_VERSION = "stable"; var DOCUMENTER_IS_DEV_VERSION = false;' > "$RUNNER_TEMP/pages/stable/siteinfo.js"
+          printf '%s\n' 'var DOC_VERSIONS = ["stable"]; var DOCUMENTER_NEWEST = "stable"; var DOCUMENTER_STABLE = "stable";' > "$RUNNER_TEMP/pages/versions.js"
+          printf '%s\n' '<!doctype html><html lang="en"><meta charset="utf-8"><title>MemoizedArrays.jl documentation</title><meta http-equiv="refresh" content="0; url=stable/"><a href="stable/">Read the documentation</a></html>' > "$RUNNER_TEMP/pages/index.html"
+      - uses: actions/upload-pages-artifact@v5
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        with:
+          path: ${{ runner.temp }}/pages
+
+  deploy-docs:
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    needs: [test, docs]
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    concurrency:
+      group: github-pages
+      cancel-in-progress: false
+    environment:
+      name: github-pages
+      url: https://ntropic.github.io/MemoizedArrays.jl/stable/
+    steps:
+      - uses: actions/configure-pages@v6
+      - name: Deploy documentation
+        id: deployment
+        uses: actions/deploy-pages@v5

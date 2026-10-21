@@ -2,8 +2,8 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue)](LICENSE)
 [![Julia 1.13+](https://img.shields.io/badge/Julia-1.13%2B-9558B2)](https://julialang.org/downloads/)
-[![Documentation](docs/src/assets/docs-badge.svg)](docs/src/index.md)
-[![Tests and documentation](https://github.com/Ntropic/MemoizedArrays.jl/actions/workflows/tests.yml/badge.svg?branch=main)](https://github.com/Ntropic/MemoizedArrays.jl/actions/workflows/tests.yml)
+[![Documentation](docs/src/assets/docs-badge.svg)](https://ntropic.github.io/MemoizedArrays.jl/stable/)
+[![Tests](https://github.com/Ntropic/MemoizedArrays.jl/actions/workflows/tests.yml/badge.svg?branch=main)](https://github.com/Ntropic/MemoizedArrays.jl/actions/workflows/tests.yml)
 
 **Compute array elements when you need them, and reuse the results.**
 
@@ -93,6 +93,10 @@ allocation probes live in `test/helpers.jl`.
 Focused implementation tests live in `test/internal/`: coordinate mapping,
 growth and relocation, LRU bookkeeping, tree pruning, and dictionary collisions.
 Concurrency regressions retain the explicit scheduling needed to reproduce races.
+
+CI builds the documentation on every run and publishes successful `main` builds
+to `/stable/`. Enable **Settings → Pages → Source → GitHub Actions** once for the
+repository. Pull requests build the docs without publishing them.
 
 Run benchmarks with `julia --project=. -t 8 benchmark.jl`. See
 [benchmark workloads and options](docs/src/benchmarks.md#reproduce-the-results)
