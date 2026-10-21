@@ -263,32 +263,7 @@ end
     return ExpandingSlot(slot.map, allocation, reference, slot.key)
 end
 
-@inline function slot_entry(slot::ExpandingSlot)
-    stored = slot_entry(slot.reference)
-    while stored === RELOCATED
-        slot = relocated_slot(slot)
-        stored = slot_entry(slot.reference)
-    end
-    return stored
-end
-
-@inline function claim_slot!(slot::ExpandingSlot, expected, desired)
-    claimed = claim_slot!(slot.reference, expected, desired)
-    if claimed.old === RELOCATED
-        return relocated_claim!(slot, expected, desired)
-    end
-    return claimed
-end
-
-@noinline function relocated_claim!(slot::ExpandingSlot, expected, desired)
-    while true
-        slot = relocated_slot(slot)
-        claimed = claim_slot!(slot.reference, expected, desired)
-        if claimed.old !== RELOCATED
-            return claimed
-        end
-    end
-end
+@inline slot_reference(slot::ExpandingSlot) = slot.reference
 
 @inline function slot_exchange!(slot::ExpandingSlot, stored, previous)
     claimed = claim_slot!(slot, previous, stored)
@@ -339,12 +314,7 @@ queue_key(::ConcurrentExpandingArrayMap{T,N}) where {T,N} = ntuple(_ -> 0, Val(N
         if slot_entry(reference) !== RELOCATED
             return previous, reference
         end
-        GC.safepoint()
-        polls += 1
-        if polls == 1024
-            yield()
-            polls = 0
-        end
+        polls = poll_step(polls)
     end
 end
 

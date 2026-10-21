@@ -45,13 +45,13 @@ end
     make() = LRUMemoizedArray(Returns(value), DictMap{typeof(value)}((1:100,)); capacity=2)
     warmup = make()
     for key in 1:4
-        replacementallocation(warmup, key)
+        request_allocations(warmup, key)
     end
     cache = make()
     entries = copy(cache.eviction.entries)
     table = cache.map.table
     for key in 1:4
-        @test replacementallocation(cache, key) == 0
+        @test request_allocations(cache, key) == 0
         stored = JA.entry(cache, JA.cache_key(cache, (key,)))
         @test any(entry -> stored === entry, entries)
         @test cache.map.table[stored.key.address] === stored
@@ -78,7 +78,7 @@ end
         nested() = (generate!(owner[], 1:80); 0)
         cache = LRUMemoizedArray(i -> begin
             calls[] += 1
-            i == 0 && return conversion ? DictMemoizedConversion(nested) : nested()
+            i == 0 && return conversion ? TestConversion(nested) : nested()
             return i
         end, DictMap{Int}((0:80,)); capacity=81)
         owner[] = cache
@@ -104,7 +104,7 @@ end
             calls[] += 1
             if !entered[]
                 entered[] = true
-                return conversion ? DictMemoizedConversion(nested) : nested()
+                return conversion ? TestConversion(nested) : nested()
             end
             return 7
         end
@@ -131,7 +131,7 @@ end
         nested() = (generate!(owner[], keys); 0)
         cache = dict_test_cache(C, Int, i -> begin
             calls[] += 1
-            i == 0 && return conversion ? DictMemoizedConversion(nested) : nested()
+            i == 0 && return conversion ? TestConversion(nested) : nested()
             return i
         end, (0:10000,); capacity=96, queues=1)
         handle = concurrent_test_handle(cache, 1)
@@ -162,14 +162,14 @@ end
                 put!(entered, nothing)
                 wait(release)
                 outcome === :generator_failure && throw(failure)
-                outcome === :conversion_failure && return DictMemoizedConversion(() -> throw(failure))
+                outcome === :conversion_failure && return TestConversion(() -> throw(failure))
             end
             return i
         end
         cache = dict_test_cache(C, Int, generator, (0:144,))
         a, b, c = (concurrent_test_handle(cache, i) for i in 1:3)
         owner = Threads.@spawn try
-            concurrent_test_error(() -> a[0])
+            test_result(() -> a[0])
         finally
             put!(entered, nothing) # an early failure must not strand synchronization
         end
@@ -183,7 +183,7 @@ end
                 partition = JA.hash_partition(cache.map, hash((0,)))
                 table = JA.slot_entry(partition.table)
                 captured = Channel{Nothing}(1)
-                waiter = Threads.@spawn concurrent_test_error() do
+                waiter = Threads.@spawn test_result() do
                     saved = JA.map_lookup(b, (0,))
                     put!(captured, nothing)
                     JA.cache_get(b, saved, (0,))
@@ -216,12 +216,12 @@ end
         generate!(a, 81:144)
         waiter !== nothing && @test dict_test_completed(waiter) === expected
         if pending !== nothing
-            @test concurrent_test_error(() -> JA.wait_generated(Int, pending.reference)) === expected
+            @test test_result(() -> JA.wait_generated(Int, pending.reference)) === expected
         end
         @test calls[] == 1
         @test isready(cache, 0) == (C === MemoizedArray && outcome === :value)
         if C === MemoizedArray || outcome !== :value
-            @test concurrent_test_error(() -> a[0]) === expected
+            @test test_result(() -> a[0]) === expected
             @test calls[] == 1
         end
     end

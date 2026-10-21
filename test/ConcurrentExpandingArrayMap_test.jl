@@ -1,16 +1,8 @@
-function expanding_test_result(f)
-    try
-        return f()
-    catch error
-        return error
-    end
-end
-
 # Capturing the lookup before growth forces the caller to retain an old slot,
 # independently of when its task next gets scheduled.
 function expanding_captured_waiter(cache, indices, captured)
     return Threads.@spawn begin
-        expanding_test_result() do
+        test_result() do
             lookup = try
                 JA.map_lookup(cache, indices)
             finally
@@ -35,12 +27,6 @@ struct ConcurrentExpandingFailure
 end
 Base.convert(::Type{Int}, source::ConcurrentExpandingFailure) = throw(source.error)
 
-function expanding_read_allocations(cache, indices)
-    cache[indices...]
-    return @allocated cache[indices...]
-end
-
-expanding_request_allocations(cache, indices) = @allocated cache[indices...]
 
 @testset "Concurrent expanding interface" begin
     map_spec = ((V, domain) -> ExpandingArrayMap{V}(domain; increment=8))
@@ -80,10 +66,10 @@ expanding_request_allocations(cache, indices) = @allocated cache[indices...]
     matrices = MemoizedArray(Returns(matrix), map_spec(typeof(matrix), (1,1)); concurrent=true)
     retained = matrices[1,1]
     @test matrices[4,5] === retained === matrices[1,1]
-    expanding_read_allocations(matrices, (1,1))
-    @test expanding_read_allocations(matrices, (1,1)) == 0
-    expanding_request_allocations(matrices, (2,1))
-    @test expanding_request_allocations(matrices, (3,1)) == 0
+    read_allocations(matrices, (1,1))
+    @test read_allocations(matrices, (1,1)) == 0
+    request_allocations(matrices, (2,1))
+    @test request_allocations(matrices, (3,1)) == 0
     @test_throws ArgumentError MemoizedArray(identity, map_spec(Int, unbound(1)); concurrent=true)
 end
 
@@ -101,9 +87,9 @@ end
     failure = ErrorException("out-of-domain generation failed")
     attempts = Ref(0)
     failing = MemoizedArray(i -> (attempts[] += 1; throw(failure)), ExpandingArrayMap{Int}((1,); increment=2); concurrent=true)
-    @test expanding_test_result(() -> failing[2]) === failure
+    @test test_result(() -> failing[2]) === failure
     @test size(failing) == (3,)
-    @test expanding_test_result(() -> failing[2]) === failure
+    @test test_result(() -> failing[2]) === failure
     @test attempts[] == 1 && !isready(failing,2)
 end
 
@@ -127,7 +113,7 @@ end
         @test cache[2,1] == 201
         owner = Threads.@spawn begin
             try
-                expanding_test_result(() -> cache[1,2])
+                test_result(() -> cache[1,2])
             finally
                 # Constructor/access failures must not leave the test waiting forever.
                 notify(entered)
@@ -146,7 +132,7 @@ end
             # A second relocation moves the pending slot through three allocations.
             @test cache[5,4] == 504
             @test size(cache) == (6,4)
-            new_waiters = [Threads.@spawn expanding_test_result(() -> cache[1,2]) for _ in 1:3]
+            new_waiters = [Threads.@spawn test_result(() -> cache[1,2]) for _ in 1:3]
             GC.gc(false)
         finally
             notify(release)
@@ -155,10 +141,10 @@ end
         @test all(result -> result === expected, fetch.([owner; old_waiters; new_waiters]))
         @test calls[] == 1
         @test isready(cache, 1,2) == (outcome === :value)
-        @test expanding_test_result(() -> cache[1,2]) === expected
+        @test test_result(() -> cache[1,2]) === expected
         @test calls[] == 1
         @test cache[9,7] == 907
-        @test expanding_test_result(() -> cache[1,2]) === expected
+        @test test_result(() -> cache[1,2]) === expected
         @test calls[] == 1
     end
 end
@@ -205,7 +191,7 @@ end
     end, ExpandingArrayMap{Tuple{Int,Int}}((1,1); increment=2); concurrent=true)
     tasks = [Threads.@spawn begin
         wait(start)
-        result = expanding_test_result(() -> cache[i,1])
+        result = test_result(() -> cache[i,1])
         result isa Exception && put!(entered, nothing)
         result
     end for i in 1:callers]
@@ -252,7 +238,7 @@ end
     end, ExpandingArrayMap{Int}((lower:lower+1,); increment=8); concurrent=true)
     owner = Threads.@spawn begin
         try
-            expanding_test_result(() -> cache[lower])
+            test_result(() -> cache[lower])
         finally
             notify(entered)
         end

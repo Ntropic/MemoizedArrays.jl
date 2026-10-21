@@ -2,16 +2,7 @@
 using Test, MemoizedArrays
 const JA = MemoizedArrays
 
-test_map_config(kind, shape=(8,); center=0.5) =
-    kind === :array ? ((V, domain) -> ArrayMap{V}(domain)) : kind === :dict ? ((V, domain) -> DictMap{V}(domain)) :
-    kind === :radix ? ((V, domain) -> RadixMap{V}(domain; block_shape=shape, center)) : ((V, domain) -> SubtreeRadixMap{V}(domain; block_shape=shape, center))
-
-function readyallocations(cache)
-    cache[ntuple(_ -> 1, ndims(cache))...]
-    return @allocated cache[ntuple(_ -> 1, ndims(cache))...]
-end
-
-replacementallocation(cache, key) = @allocated cache[key]
+include("helpers.jl")
 
 @testset "Concurrency is a cache type parameter" begin
     for concurrent in (false, true)
@@ -215,8 +206,8 @@ end
     end
     cache = LRUMemoizedArray(identity, ArrayMap{Int}((4,)); capacity=1)
     cache[1]
-    replacementallocation(cache, 2)
-    @test replacementallocation(cache, 3) == 0
+    request_allocations(cache, 2)
+    @test request_allocations(cache, 3) == 0
     # Nested generation can resize the dictionary before the outer value is stored.
     nested = MemoizedArray(i -> i == 0 ? sum(nested[k] for k in 1:60) : i, DictMap{Int}((0:60,)))
     @test nested[0] == sum(1:60)
@@ -304,17 +295,17 @@ end
     make() = LRUMemoizedArray(Returns(value), ArrayMap{typeof(value)}((8,)); capacity=3)
     warmup = make()
     for key in 1:4
-        replacementallocation(warmup, key)
+        request_allocations(warmup, key)
     end
     cache = make()
     entries = copy(cache.eviction.entries)
     @test cache.eviction.count == 0 && !isready(cache, 1)
     for key in 1:3
-        @test replacementallocation(cache, key) == 0
+        @test request_allocations(cache, key) == 0
         @test any(entry -> JA.entry(cache, key) === entry, entries)
     end
-    @test replacementallocation(cache, 4) == 0
-    @test replacementallocation(cache, 4) == 0
+    @test request_allocations(cache, 4) == 0
+    @test request_allocations(cache, 4) == 0
     @test cache.eviction.count == 3 && !isready(cache, 1)
 end
 

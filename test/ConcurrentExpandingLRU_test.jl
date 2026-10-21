@@ -79,7 +79,7 @@ end
         a, b, c = (queue_handle(cache, i) for i in 1:3)
         owner = Threads.@spawn begin
             try
-                expanding_test_result(() -> a[1,2])
+                test_result(() -> a[1,2])
             finally
                 notify(entered)
             end
@@ -107,12 +107,12 @@ end
         @test a[7,6] == 706 # immediately recycle the owner's entry and grow again
         @test fetch(waiter) === expected
         if pending isa JA.GenerateWait
-            @test expanding_test_result(() -> JA.wait_generated(Int, pending.reference)) === expected
+            @test test_result(() -> JA.wait_generated(Int, pending.reference)) === expected
         end
         @test calls[] == 1
         @test !isready(cache, 1,2)
         if outcome !== :value
-            @test expanding_test_result(() -> a[1,2]) === failure
+            @test test_result(() -> a[1,2]) === failure
             @test calls[] == 1
         end
     end
@@ -133,7 +133,7 @@ end
     end, ExpandingArrayMap{Tuple{Int,Int}}((1,1); increment=4); capacity=8, concurrent=true, queues=callers)
     handles = [queue_handle(cache, i) for i in 1:callers]
     tasks = [Threads.@spawn begin
-        result = expanding_test_result(() -> handles[i][i,1])
+        result = test_result(() -> handles[i][i,1])
         if result isa Exception
             put!(entered, nothing)
         end
@@ -166,11 +166,11 @@ end
     value = ones(4,4)
     cache = LRUMemoizedArray(Returns(value), ExpandingArrayMap{typeof(value)}((8,2); increment=4); capacity=2, concurrent=true, queues=1)
     handle = queue_handle(cache, 1)
-    expanding_request_allocations(handle, (1,1))
-    @test expanding_request_allocations(handle, (2,1)) == 0
-    expanding_request_allocations(handle, (3,1))
-    @test expanding_request_allocations(handle, (4,1)) == 0
-    @test expanding_read_allocations(handle, (4,1)) == 0
+    request_allocations(handle, (1,1))
+    @test request_allocations(handle, (2,1)) == 0
+    request_allocations(handle, (3,1))
+    @test request_allocations(handle, (4,1)) == 0
+    @test read_allocations(handle, (4,1)) == 0
     @test handle[4,1] === value
 end
 

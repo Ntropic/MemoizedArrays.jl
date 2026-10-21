@@ -51,9 +51,9 @@ end
         end
         cache=LRUMemoizedArray(generator, ArrayMap{Vector{Int}}((16,)); concurrent=true, capacity=3, queues=3)
         a,b,c=queue_handle(cache,1),queue_handle(cache,2),queue_handle(cache,3)
-        owner=Threads.@spawn concurrent_test_error(()->a[1])
+        owner=Threads.@spawn test_result(()->a[1])
         wait(entered)
-        waiter=Threads.@spawn concurrent_test_error(()->b[1])
+        waiter=Threads.@spawn test_result(()->b[1])
         ref=JA.map_slot(cache.map,1,nothing)
         while !(JA.slot_entry(ref) isa JA.GenerateWait)
             yield()
@@ -66,10 +66,10 @@ end
         @test fetch(owner)===expected
         @test a[3]===value # eviction cannot erase the registered completion
         @test fetch(waiter)===expected
-        @test concurrent_test_error(()->JA.wait_generated(Vector{Int},pending.reference))===expected
+        @test test_result(()->JA.wait_generated(Vector{Int},pending.reference))===expected
         @test calls[]==3
         if fail
-            @test concurrent_test_error(()->a[1])===failure
+            @test test_result(()->a[1])===failure
             @test calls[]==3
         end
     end
@@ -247,17 +247,16 @@ end
     check_private_queues(cache)
 end
 
-private_request_allocations(handle,key) = @allocated handle[key]
 
 @testset "Private LRU matrix entries are reused without allocation" begin
     value = ones(4,4)
     cache = LRUMemoizedArray(Returns(value), ArrayMap{typeof(value)}((16,)); concurrent=true, capacity=2, queues=1)
     handle = queue_handle(cache,1)
-    private_request_allocations(handle,1) # compile measurement and read paths
-    @test private_request_allocations(handle,2) == 0
-    private_request_allocations(handle,3) # compile eviction path
-    @test private_request_allocations(handle,4) == 0
-    @test private_request_allocations(handle,4) == 0
+    request_allocations(handle,1) # compile measurement and read paths
+    @test request_allocations(handle,2) == 0
+    request_allocations(handle,3) # compile eviction path
+    @test request_allocations(handle,4) == 0
+    @test request_allocations(handle,4) == 0
 end
 
 @testset "Private queues: simultaneous reads, generation and reuse" begin

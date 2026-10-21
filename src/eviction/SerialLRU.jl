@@ -43,22 +43,10 @@ end
         queue_touch!(q, index)
     else
         index = q.vacant
-        q.vacant = @inbounds memoryref(q.links, 2Int(index))[]
         stored = @inbounds q.entries[index]
         stored.key = key
         stored.value = value
-        @inbounds begin
-            if q.count == 0
-                q.oldest = index
-                memoryref(q.links, 2Int(index) - 1)[] = index
-            else
-                memoryref(q.links, 2Int(q.newest))[] = index
-                memoryref(q.links, 2Int(index) - 1)[] = q.newest
-            end
-            memoryref(q.links, 2Int(index))[] = index
-        end
-        q.newest = index
-        q.count += 1
+        queue_append!(q,index)
     end
     return stored
 end

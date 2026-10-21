@@ -135,11 +135,6 @@ end
     end
 end
 
-function tree_read_allocations(cache, key)
-    cache[key...]
-    return @allocated cache[key...]
-end
-
 @testset "Cache-side tree offsets" begin
     for (C, options) in ((MemoizedArray, (;)), (LRUMemoizedArray, (; capacity=2))),
         map_spec in (:radix, :subtree)
@@ -164,7 +159,7 @@ end
                 end
                 @test cache[key...] === key
                 @test isready(cache, key...)
-                @test tree_read_allocations(cache, key) == 0
+                @test read_allocations(cache, key) == 0
             end
             @test JA.entry(cache, (0,0)).value === (0,0)
             @test (@inferred cache[0,0]) === (0,0)
@@ -189,7 +184,7 @@ end
                 (JA.map_routing(cache.map, key), JA.root_index(cache.map, JA.map_routing(cache.map, key))) :
                 JA.map_routing(cache.map, key))
         end
-        @test tree_read_allocations(cache, hi) == 0
+        @test read_allocations(cache, hi) == 0
         @test_throws ArgumentError C(identity, (test_map_config(map_spec, (8,); center=0))(Int, unbound(1)); options...)
         @test_throws MethodError C(identity, ArrayMap{Int}((8,)); center, options...)
     end

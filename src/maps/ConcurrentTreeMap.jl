@@ -145,7 +145,7 @@ Base.@constprop :aggressive function concurrent_tree_map(kind::Type{K}, ::Type{V
         T = Union{Empty,Generating,GenerationFailure,S}
         retention, registry = nothing, nothing
     else
-        T = Union{Empty,Generating,GenerationFailure,GenerateWait{S},Relocated,SharedLRUEntry{S,NTuple{N,Int}}}
+        T = Union{Empty,Generating,GenerationFailure,GenerateWait{S},SharedLRUEntry{S,NTuple{N,Int}}}
         retention = TreeRetention(typemin(Int))
         registry = Memory{ConcurrentLeafSlot{T,N,TreeRetention}}(undef, capacity)
     end

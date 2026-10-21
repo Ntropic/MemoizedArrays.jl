@@ -1,27 +1,4 @@
 # Public constructors; each concurrent LRU handle has one active caller.
-function concurrent_test_error(f)
-    try
-        return f()
-    catch error
-        return error
-    end
-end
-
-function concurrent_test_cache(C, V, generator, domain; capacity=8, queues=8, map_factory=((V, domain) -> ArrayMap{V}(domain)))
-    if C === MemoizedArray
-        return C(generator, map_factory(V, domain); concurrent=true)
-    end
-    return C(generator, map_factory(V, domain); capacity, queues, concurrent=true)
-end
-
-concurrent_test_handle(cache::MemoizedArray, _) = cache
-concurrent_test_handle(cache::LRUMemoizedArray, i) = queue_handle(cache, i)
-
-function concurrent_test_readallocations(cache)
-    cache[1]
-    return @allocated cache[1]
-end
-
 @testset "Concurrent array and dictionary constructors and interface" begin
     for map_factory in (((V, domain) -> ArrayMap{V}(domain)), ((V, domain) -> DictMap{V}(domain))), C in (MemoizedArray, LRUMemoizedArray)
         options = C === MemoizedArray ? (;) : (; capacity=4)
@@ -73,12 +50,12 @@ end
         end
         cache = concurrent_test_cache(C, Vector{Int}, generator, (8,); map_factory)
         handles = [concurrent_test_handle(cache, i) for i in 1:4]
-        owner = Threads.@spawn concurrent_test_error(() -> handles[1][1])
+        owner = Threads.@spawn test_result(() -> handles[1][1])
         wait(entered)
         started = Channel{Nothing}(3)
         waiters = [Threads.@spawn begin
             put!(started, nothing)
-            concurrent_test_error(() -> handles[i][1])
+            test_result(() -> handles[i][1])
         end for i in 2:4]
         for _ in waiters
             take!(started)
@@ -93,7 +70,7 @@ end
         @test all(result -> result === (fail ? failure : value), results)
         @test calls[] == 1
         @test isready(cache, 1) == !fail
-        @test concurrent_test_error(() -> handles[1][1]) === (fail ? failure : value)
+        @test test_result(() -> handles[1][1]) === (fail ? failure : value)
         @test calls[] == 1
     end
 end

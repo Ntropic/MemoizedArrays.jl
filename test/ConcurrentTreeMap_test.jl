@@ -1,10 +1,4 @@
 # Concurrent Memoized leaves remain valid when insertion creates new ancestors.
-struct ConcurrentTreeConversion{F}
-    convert::F
-end
-Base.convert(::Type{Int}, source::ConcurrentTreeConversion) = source.convert()
-
-tree_request_allocations(cache, key) = @allocated cache[key...]
 
 @testset "Tree structure permits insertion peers and excludes pruning" begin
     gate = JA.TreeStructure()
@@ -78,12 +72,12 @@ end
         for value in (matrix, selected)
             matrices = MemoizedArray(Returns(value), configuration(typeof(value), unbound(2)); concurrent=true)
             @test matrices[0, 0] === value
-            tree_request_allocations(matrices, (0, 0))
-            @test tree_request_allocations(matrices, (0, 0)) == 0
+            request_allocations(matrices, (0, 0))
+            @test request_allocations(matrices, (0, 0)) == 0
             # Existing-leaf generation allocates neither tree nodes nor values.
-            tree_request_allocations(matrices, (1, 0))
+            request_allocations(matrices, (1, 0))
             if value === matrix
-                @test tree_request_allocations(matrices, (0, 1)) == 0
+                @test request_allocations(matrices, (0, 1)) == 0
             end
             @test matrices[typemax(Int), typemin(Int)] === value
             GC.gc(false)
@@ -104,13 +98,13 @@ end
                 put!(entered, nothing)
                 wait(release)
                 outcome === :generator_failure && throw(failure)
-                outcome === :conversion_failure && return ConcurrentTreeConversion(() -> throw(failure))
+                outcome === :conversion_failure && return TestConversion(() -> throw(failure))
             end
             return i ⊻ j
         end
         cache = MemoizedArray(generator, Config{Int}(unbound(2); block_shape=(4, 8)); concurrent=true)
         owner = Threads.@spawn try
-            concurrent_test_error(() -> cache[0, 0])
+            test_result(() -> cache[0, 0])
         finally
             put!(entered, nothing)
         end
@@ -126,7 +120,7 @@ end
                 waiter = Threads.@spawn begin
                     lookup = JA.map_lookup(cache, (0, 0))
                     put!(captured, nothing)
-                    concurrent_test_error(() -> JA.cache_get(cache, lookup, (0, 0)))
+                    test_result(() -> JA.cache_get(cache, lookup, (0, 0)))
                 end
                 @test timedwait(() -> isready(captured), 5; pollint=0.001) === :ok
                 for key in ((8, 8), (-32, 64), (1024, -8192), (typemin(Int), typemax(Int)))
@@ -144,7 +138,7 @@ end
         if waiter !== nothing
             @test fetch(waiter) === expected
         end
-        @test concurrent_test_error(() -> cache[0, 0]) === expected
+        @test test_result(() -> cache[0, 0]) === expected
         @test isready(cache, 0, 0) == (outcome === :value)
         @test calls[] == 1
     end
@@ -157,7 +151,7 @@ end
         nested() = (foreach(key -> owner[][key...], keys); 17)
         cache = MemoizedArray((i, j) -> begin
             if i == j == 0
-                return conversion ? ConcurrentTreeConversion(nested) : nested()
+                return conversion ? TestConversion(nested) : nested()
             end
             return i ⊻ j
         end, Config{Int}(unbound(2); block_shape=(4, 8)); concurrent=true)

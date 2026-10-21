@@ -168,7 +168,6 @@ function block_length(shape, minimum::Int)
     return count
 end
 
-@inline tree_bits(store::TreeMap, axis::Int, level::Int) = tree_bits(block_shape(store), axis, level)
 @inline tree_bits(block::Tuple, axis::Int, level::Int) = (level + 1) * trailing_zeros(block[axis])
 
 @inline function tree_prefix(block::NTuple{N,Int}, key, level::Int) where N

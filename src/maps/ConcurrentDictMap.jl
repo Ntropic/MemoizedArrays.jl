@@ -153,32 +153,7 @@ end
     return DictSlot(slot.map, record)
 end
 
-@inline function slot_entry(slot::DictSlot)
-    stored = slot_entry(slot.record)
-    while stored === RELOCATED
-        slot = relocated_slot(slot)
-        stored = slot_entry(slot.record)
-    end
-    return stored
-end
-
-@inline function claim_slot!(slot::DictSlot, expected, desired)
-    claimed = claim_slot!(slot.record, expected, desired)
-    if claimed.old === RELOCATED
-        return relocated_claim!(slot, expected, desired)
-    end
-    return claimed
-end
-
-@noinline function relocated_claim!(slot::DictSlot, expected, desired)
-    while true
-        slot = relocated_slot(slot)
-        claimed = claim_slot!(slot.record, expected, desired)
-        if claimed.old !== RELOCATED
-            return claimed
-        end
-    end
-end
+@inline slot_reference(slot::DictSlot) = slot.record
 
 @inline function slot_exchange!(slot::DictSlot, stored, previous)
     while true

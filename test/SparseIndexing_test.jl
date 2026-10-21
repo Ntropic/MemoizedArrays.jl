@@ -27,11 +27,6 @@
     @test_throws DimensionMismatch MemoizedArray(identity, RadixMap{Int}((1:3,); block_shape=[8, 8]))
 end
 
-struct DictMemoizedConversion{F}
-    convert::F
-end
-Base.convert(::Type{Int}, value::DictMemoizedConversion) = value.convert()
-
 @testset "Dictionary Memoized publication preserves values and conversion effects" begin
     values = (nothing, false, JA.EMPTY, JA.GENERATING, JA.RELOCATED,
         JA.HASH_EMPTY, JA.HASH_DELETED, JA.GenerationFailure(ErrorException("a cached value")))
@@ -42,7 +37,7 @@ Base.convert(::Type{Int}, value::DictMemoizedConversion) = value.convert()
 
     owner = Ref{Any}()
     calls = Ref(0)
-    converted = DictMemoizedConversion(() -> begin
+    converted = TestConversion(() -> begin
         generate!(owner[], 1:80) # conversion rehashes the table before the outer record is inserted
         0
     end)
@@ -63,7 +58,7 @@ Base.convert(::Type{Int}, value::DictMemoizedConversion) = value.convert()
         failing = MemoizedArray(i -> begin
             if i == 2
                 if conversion
-                    return DictMemoizedConversion(() -> throw(failure))
+                    return TestConversion(() -> throw(failure))
                 end
                 throw(failure)
             end

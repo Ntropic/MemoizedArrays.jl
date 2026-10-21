@@ -76,7 +76,12 @@ end
     return concurrent_tree_miss!(cache, ref, indices...)
 end
 
-@noinline function concurrent_tree_miss!(cache::MemoizedArray{V,N}, ref, indices::Vararg{Int,N}) where {V,N}
+# Passing memory and offset keeps the cold call from boxing the hot slot reference.
+@inline concurrent_tree_miss!(cache, ref, indices...) = concurrent_tree_miss!(cache,
+    ref === nothing ? nothing : ref.mem, ref === nothing ? 0 : Core.memoryrefoffset(ref), indices...)
+
+@noinline function concurrent_tree_miss!(cache::MemoizedArray{V,N}, mem, address::Int, indices::Vararg{Int,N}) where {V,N}
+    ref = mem === nothing ? nothing : memoryref(mem, address)
     if ref === nothing
         ref = map_reserve!(cache.map, indices, cache_routing(cache, indices))
     end
@@ -155,7 +160,11 @@ end
     return expanding_miss!(cache, key, allocation, ref, indices)
 end
 
-@noinline function expanding_miss!(cache::MemoizedArray{V}, key, allocation, ref, indices) where V
+@inline expanding_miss!(cache, key, allocation, ref, indices) = expanding_miss!(cache, key, allocation,
+    ref === nothing ? nothing : ref.mem, ref === nothing ? 0 : Core.memoryrefoffset(ref), indices)
+
+@noinline function expanding_miss!(cache::MemoizedArray{V}, key, allocation, mem, address::Int, indices) where V
+    ref = mem === nothing ? nothing : memoryref(mem, address)
     map = cache.map
     if ref === nothing
         allocation = grow_allocation!(map, key)
@@ -183,12 +192,7 @@ end
         if stored === RELOCATED
             allocation, ref = relocated_slot(map, allocation, key)
         elseif stored === GENERATING
-            GC.safepoint()
-            polls += 1
-            if polls == 1024
-                yield()
-                polls = 0
-            end
+            polls = poll_step(polls)
         elseif stored isa GenerationFailure
             throw(stored.error)
         else

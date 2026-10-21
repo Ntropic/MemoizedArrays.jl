@@ -70,37 +70,9 @@ end
     return address
 end
 
-# Allocate and initialize slots for maps and tree blocks.
-empty_map(::Type{T}, shape, empty=EMPTY) where T = empty_map(T, shape, empty, Val(false))
-function empty_map(::Type{T}, shape, empty, ::Val{Atomic}, ::Val{Check}=Val(:check)) where {T,Atomic,Check}
-    count = 1
-    for dimension in shape
-        if Check !== :nocheck && dimension < 0
-            throw(ArgumentError("dimensions must be nonnegative"))
-        end
-        count = Check === :nocheck ? count * dimension : Base.checked_mul(count, dimension)
-    end
-    map = Atomic ? AtomicMemory{T}(undef, count) : Memory{T}(undef, count)
-    @inbounds for address in eachindex(map)
-        if Atomic
-            @atomic :monotonic map[address] = empty
-        else
-            map[address] = empty
-        end
-    end
-    return map
-end
-
-# Slot references share read/write operations with dictionary records and tree nodes.
-@inline slot_entry(slot::MemoryRef{T}) where T = @inbounds slot[]
-@inline slot_publish!(slot::MemoryRef{T}, value) where T = (@inbounds slot[] = value)
-@inline slot_entry(slot::GenericMemoryRef{:atomic}) = Core.memoryrefget(slot, :acquire, false)
-@inline slot_publish!(slot::GenericMemoryRef{:atomic}, value) = Core.memoryrefset!(slot, value, :release, false)
 @inline map_routing(::DenseMap, key) = nothing
 @inline map_slot(map::DenseMap, key, routing) = @inbounds memoryref(map.reference, slot_address(map, key))
 @inline map_reserve!(map::DenseMap, key, routing) = map_slot(map, key, routing)
-@inline prepare(map, key, routing) = (map_slot(map, key, routing), nothing)
-@inline prepared_entry(slot, hint) = slot_entry(slot)
 @inline reserve!(map::DenseMap, key, routing, slot, hint) = slot
 map_retain!(::DenseMap, slot) = nothing
 
@@ -131,11 +103,6 @@ function concurrent_array_map(kind, ::Type{V}, shape) where V
     return ConcurrentArrayMap(Union{Empty,Generating,GenerationFailure,GenerateWait{S},Stored}, shape)
 end
 
-@inline claim_slot!(ref, expected, desired) =
-    Core.memoryrefreplace!(ref, expected, desired, :acquire_release, :acquire, false)
-
-@inline slot_exchange!(ref, stored) = Core.memoryrefswap!(ref, stored, :acquire_release, false)
-@inline slot_exchange!(ref, stored, expected) = slot_exchange!(ref, stored)
 @inline remove_mapping!(map::ConcurrentArrayMap, entry) =
     slot_publish!(map_slot(map, (@atomic :acquire entry.key), nothing), EMPTY)
 queue_key(::ConcurrentArrayMap) = 0

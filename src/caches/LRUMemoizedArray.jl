@@ -60,10 +60,10 @@ end
 resident_count(cache::LRUMemoizedArray) = resident_count(cache.eviction)
 resident_count(queue::SerialLRUQueue) = queue.count
 
-@inline function cache_get(cache::LRUMemoizedArray{V,N,M}, lookup, indices::Tuple) where {V,N,M<:Union{ArrayMap,ExpandingArrayMap}}
+@inline function cache_get(cache::LRUMemoizedArray{V,N,M}, lookup, indices::Tuple) where {V,N,M<:Union{ArrayMap,ExpandingArrayMap,TreeMap}}
     key, routing, slot, hint = lookup
     if slot !== nothing
-        stored = slot_entry(slot)
+        stored = prepared_entry(slot, hint)
         if stored !== cache.map.empty
             stored.explicit && return stored.value
             queue_touch!(cache.eviction, stored.id)
@@ -72,11 +72,18 @@ resident_count(queue::SerialLRUQueue) = queue.count
     end
     generated = cache.generator(indices...)
     value = generated isa V ? generated : (convert(V, generated)::V)
-    # Nested generation/conversion may have grown storage. Reserve its current
-    # destination before changing the queue; failed growth must not evict a value.
+    # Nested requests may grow the map; reserve before eviction can change it.
     slot = reserve!(cache.map, key, routing, slot, hint)
-    existing = slot_entry(slot)
-    existing !== cache.map.empty && existing.explicit && return existing.value
+    stored = slot_entry(slot)
+    if stored !== cache.map.empty
+        # A nested generator or conversion may have completed this key already.
+        stored.explicit && return stored.value
+        stored.value = value
+        queue_touch!(cache.eviction, stored.id)
+        return value
+    end
+    # Keep a tree destination alive when eviction empties that leaf.
+    map_retain!(cache.map, slot)
     stored = serial_insert!(cache, cache.eviction, key, value)
     slot_publish!(slot, stored)
     return value
@@ -92,34 +99,6 @@ end
     generated = cache.generator(indices...)
     value = generated isa V ? generated : (convert(V, generated)::V)
     return dict_lru_insert!(cache, key, hashed, hint..., value)
-end
-
-# Tree admission retains its destination before eviction can empty that leaf.
-@inline function cache_get(cache::LRUMemoizedArray{V,N,M}, lookup, indices::Tuple) where {V,N,M<:TreeMap}
-    key, routing, slot, hint = lookup
-    if slot !== nothing
-        stored = prepared_entry(slot, hint)
-        if stored !== cache.map.empty
-            stored.explicit && return stored.value
-            queue_touch!(cache.eviction, stored.id)
-            return stored.value
-        end
-    end
-    generated = cache.generator(indices...)
-    value = generated isa V ? generated : (convert(V, generated)::V)
-    slot = reserve!(cache.map, key, routing, slot, hint)
-    stored = slot_entry(slot)
-    if stored !== cache.map.empty
-        # A nested generator or conversion may have completed this key already.
-        stored.explicit && return stored.value
-        stored.value = value
-        queue_touch!(cache.eviction, stored.id)
-        return value
-    end
-    map_retain!(cache.map, slot)
-    stored = serial_insert!(cache, cache.eviction, key, value)
-    slot_publish!(slot, stored)
-    return value
 end
 
 struct QueueHandle{V,N,M<:Union{ConcurrentArrayMap,ConcurrentExpandingArrayMap,ConcurrentDictMap,ConcurrentTreeMap},C,Q} <: AbstractMemoizedArray{V,N,M}

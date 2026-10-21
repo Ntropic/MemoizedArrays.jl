@@ -1,14 +1,3 @@
-struct TreeLRUConversion{F}
-    convert::F
-end
-Base.convert(::Type{Int}, value::TreeLRUConversion) = value.convert()
-
-tree_lru_result(f) = try
-    f()
-catch failure
-    failure
-end
-tree_lru_allocations(handle, key) = @allocated handle[key...]
 tree_lru_wait(f) = timedwait(f, 5; pollint=0.001)
 
 @testset "Concurrent tree LRU coordinates, ordering and reuse" begin
@@ -48,7 +37,7 @@ end
             i + j
         end, Config{Int}(unbound(2); block_shape=(8, 8)); capacity=2, concurrent=true, queues=2)
         handles = [queue_handle(cache, i) for i in 1:2]
-        requests = [Threads.@spawn tree_lru_result(() -> handles[i][i-1, 0]) for i in 1:2]
+        requests = [Threads.@spawn test_result(() -> handles[i][i-1, 0]) for i in 1:2]
         try
             for _ in 1:2
                 arrived = tree_lru_wait(() -> isready(entered))
@@ -79,7 +68,7 @@ end
         @test a[8, 0] == 8
         stale = JA.map_lookup(cache, (8, 1))
         leaf = stale[4]
-        request = Threads.@spawn tree_lru_result(() -> b[9, 0])
+        request = Threads.@spawn test_result(() -> b[9, 0])
         try
             started = tree_lru_wait(() -> isready(entered))
             @test started === :ok
@@ -225,7 +214,7 @@ end
             if i == 0
                 calls[] += 1
                 if conversion
-                    return TreeLRUConversion(() -> throw(failure))
+                    return TestConversion(() -> throw(failure))
                 end
                 throw(failure)
             end
@@ -234,8 +223,8 @@ end
         handle = queue_handle(cache, 1)
         @test handle[1, 0] == 1
         @test handle[2, 0] == 2
-        @test tree_lru_result(() -> handle[0, 0]) === failure
-        @test tree_lru_result(() -> handle[0, 0]) === failure
+        @test test_result(() -> handle[0, 0]) === failure
+        @test test_result(() -> handle[0, 0]) === failure
         @test calls[] == 1
         @test isready(cache, 2, 0) && !isready(cache, 0, 0)
         @test JA.resident_count(cache) == 1
@@ -253,7 +242,7 @@ end
                 put!(entered, nothing)
                 wait(release)
                 outcome === :generator_failure && throw(failure)
-                outcome === :conversion_failure && return TreeLRUConversion(() -> throw(failure))
+                outcome === :conversion_failure && return TestConversion(() -> throw(failure))
             end
             i + j
         end, Config{Int}(unbound(2); block_shape=(8, 8)); capacity=3, concurrent=true, queues=3)
@@ -268,7 +257,7 @@ end
         stale = JA.map_lookup(cache, (8, 0))
         a[64, 0]
         @test (@atomic :acquire stale[4].retention.count) == typemin(Int)
-        owner = Threads.@spawn tree_lru_result(() -> JA.cache_get(a, stale, (8, 0)))
+        owner = Threads.@spawn test_result(() -> JA.cache_get(a, stale, (8, 0)))
         waiter, pending = nothing, nothing
         try
             started = tree_lru_wait(() -> isready(entered))
@@ -279,7 +268,7 @@ end
                 @test leaf !== stale[4]
                 @test (@atomic :acquire leaf.retention.count) == 1
                 @test JA.slot_entry(stale[3]) === JA.EMPTY
-                waiter = Threads.@spawn tree_lru_result(() -> b[8, 0])
+                waiter = Threads.@spawn test_result(() -> b[8, 0])
                 @test tree_lru_wait(() -> JA.slot_entry(slot) isa JA.GenerateWait) === :ok
                 pending = JA.slot_entry(slot)
                 @test c[-64, 128] == 64
@@ -294,11 +283,11 @@ end
             @test fetch(waiter) === expected
         end
         if pending isa JA.GenerateWait
-            @test tree_lru_result(() -> JA.wait_generated(Int, pending.reference)) === expected
+            @test test_result(() -> JA.wait_generated(Int, pending.reference)) === expected
         end
         @test calls[] == 1
         if outcome !== :value
-            @test tree_lru_result(() -> a[8, 0]) === failure
+            @test test_result(() -> a[8, 0]) === failure
             @test !isready(cache, 8, 0)
             @test calls[] == 1
             @test a[64, 0] == 64 # remove the last ready value from the failure's leaf
@@ -317,7 +306,7 @@ end
         inner() = (owner[][nested...]; 17)
         cache = LRUMemoizedArray((i, j) -> begin
             calls[] += 1
-            (i, j) == (0, 0) && return conversion ? TreeLRUConversion(inner) : inner()
+            (i, j) == (0, 0) && return conversion ? TestConversion(inner) : inner()
             i + j
         end, Config{Int}(unbound(2); block_shape=(8, 8)); capacity=1, concurrent=true, queues=1)
         handle = queue_handle(cache, 1)
@@ -335,12 +324,12 @@ end
     for Config in (RadixMap, SubtreeRadixMap)
         cache = LRUMemoizedArray(Returns(value), Config{typeof(value)}(unbound(2); block_shape=(8, 8)); capacity=3, concurrent=true, queues=1)
         handle = queue_handle(cache, 1)
-        tree_lru_allocations(handle, (0, 0))
-        tree_lru_allocations(handle, (1, 0)) # warm the existing-leaf miss separately
-        @test tree_lru_allocations(handle, (2, 0)) == 0
-        tree_lru_allocations(handle, (3, 0))
-        @test tree_lru_allocations(handle, (-1, 0)) == 0
-        @test tree_lru_allocations(handle, (-1, 0)) == 0
+        request_allocations(handle, (0, 0))
+        request_allocations(handle, (1, 0)) # warm the existing-leaf miss separately
+        @test request_allocations(handle, (2, 0)) == 0
+        request_allocations(handle, (3, 0))
+        @test request_allocations(handle, (-1, 0)) == 0
+        @test request_allocations(handle, (-1, 0)) == 0
         @test handle[-1, 0] === value
     end
 end

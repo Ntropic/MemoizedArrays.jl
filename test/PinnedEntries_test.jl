@@ -19,9 +19,8 @@ pinned_configs(T) = (ArrayMap{T}((0:128,)), ExpandingArrayMap{T}((0:3,); increme
         @test JA.resident_count(cache) == 0
         handle[1] = [102]
         @test JA.entry(cache,JA.cache_key(cache,(1,))) !== pin
-        for i in 2:128
-            @test handle[i] == [i]
-        end
+        generated = [handle[i] for i in 2:128]
+        @test generated == [[i] for i in 2:128]
         @test retained == [1]
         @test pin.value == [101]
         @test handle[0] == [100] && handle[1] == [102]
@@ -57,14 +56,39 @@ end
 
 @testset "Pinned seeds and conversion failure" begin
     for concurrent in (false,true)
-        cache = LRUMemoizedArray(i -> handle[i-1]+1,ArrayMap{Int}((12,));capacity=1,queues=1,concurrent)
+        calls = zeros(Int, 12)
+        cache = LRUMemoizedArray(ArrayMap{Int}((12,)); capacity=1, queues=1, concurrent) do i
+            calls[i] += 1
+            handle[i-1] + 1
+        end
         handle = concurrent ? queue_handle(cache,1) : cache
         handle[1] = 1
         @test handle[12] == 12
+        @test calls == [0; ones(Int, 11)]
+        @test isready(handle, 1) && !isready(handle, 2)
+        @test JA.resident_count(cache) == 1
         @test handle[1] == 1
         @test_throws InexactError setindex!(handle,0.5,1)
         @test handle[1] == 1
         @test_throws BoundsError setindex!(handle,1,13)
+    end
+    # Nested generation or conversion must admit a key only once.
+    for config in pinned_configs(Int), conversion in (false,true)
+        calls = Ref(0)
+        cache = LRUMemoizedArray(config; capacity=2) do i
+            complete = () -> begin
+                calls[] += 1
+                i == 1 && calls[] == 1 ? cache[i] + 1 : i
+            end
+            conversion ? TestConversion(complete) : complete()
+        end
+        @test cache[1] == 2 && calls[] == 2
+        @test JA.resident_count(cache) == 1
+        cache[1] = 42
+        @test JA.resident_count(cache) == 0
+        @test [cache[i] for i in 2:4] == collect(2:4)
+        @test isready(cache,1) && cache[1] == 42
+        @test JA.resident_count(cache) == 2
     end
     # A nested generator can supply the requested value explicitly.
     for config in pinned_configs(Int)
@@ -116,17 +140,23 @@ end
     for config in pinned_configs(Int)
         cache = LRUMemoizedArray(identity,config;capacity=8,queues=4,concurrent=true)
         handles = queue_handles(cache)
-        @sync for q in 1:4
+        foreach(h -> h[0], handles)
+        tasks = map(1:4) do q
             Threads.@spawn begin
-                h = handles[q]
+                h, valid = handles[q], true
                 for i in 1:24
                     h[q] = -q
+                    h[0] = -q
                     h[4i+q]
-                    @test h[q] == -q
+                    valid &= h[q] == -q
+                    valid &= h[0] in -4:-1
                 end
+                valid
             end
         end
+        @test all(fetch.(tasks))
         @test all(q -> handles[q][q] == -q,1:4)
+        @test JA.entry(cache, JA.cache_key(cache, (0,))).explicit
     end
 end
 
@@ -149,30 +179,13 @@ end
         cache = LRUMemoizedArray(Returns(payload),ArrayMap{typeof(payload)}((8,));capacity=2,concurrent,queues=1)
         h = concurrent ? queue_handle(cache,1) : cache
         h[1] = payload
-        replacementallocation(h,1)
-        @test replacementallocation(h,1) == 0
-        replacementallocation(h,2)
-        @test replacementallocation(h,3) == 0
-        @test replacementallocation(h,4) == 0
+        request_allocations(h,1)
+        @test request_allocations(h,1) == 0
+        request_allocations(h,2)
+        @test request_allocations(h,3) == 0
+        @test request_allocations(h,4) == 0
         h[4] = payload
-        @test replacementallocation(h,5) == 0
+        @test request_allocations(h,5) == 0
         @test h[1] === h[4] === payload
     end
-end
-
-@testset "Concurrent assignments to one entry" begin
-    cache = LRUMemoizedArray(identity,ArrayMap{Int}((128,));capacity=8,queues=4,concurrent=true)
-    handles = queue_handles(cache)
-    foreach(h -> h[1],handles)
-    @sync for q in 1:4
-        Threads.@spawn begin
-            h = handles[q]
-            for i in 1:24
-                h[1] = -q
-                h[4i+q]
-                @test h[1] in -4:-1
-            end
-        end
-    end
-    @test JA.entry(cache,1).explicit
 end

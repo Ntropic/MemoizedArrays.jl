@@ -193,11 +193,6 @@ end
     @test scalar[] == scalar[] == 17
 end
 
-struct TreeMemoizedConversion{F}
-    generate::F
-end
-Base.convert(::Type{Int}, value::TreeMemoizedConversion) = value.generate()
-
 @testset "Serial tree queue reentrant admission and entry reuse" begin
     for Config in (RadixMap, SubtreeRadixMap), conversion in (false, true)
         owner, entered = Ref{Any}(), Ref(false)
@@ -206,7 +201,7 @@ Base.convert(::Type{Int}, value::TreeMemoizedConversion) = value.generate()
             i != 0 && return i
             entered[] && return 7
             entered[] = true
-            return conversion ? TreeMemoizedConversion(nested) : nested()
+            return conversion ? TestConversion(nested) : nested()
         end, Config{Int}(unbound(1); block_shape=(8,)); capacity=1)
         owner[] = cache
         @test cache.eviction isa JA.SerialLRUQueue
@@ -221,9 +216,9 @@ Base.convert(::Type{Int}, value::TreeMemoizedConversion) = value.generate()
     for Config in (RadixMap, SubtreeRadixMap)
         cache = LRUMemoizedArray(Returns(value), Config{typeof(value)}(unbound(1); block_shape=(8,)); capacity=1)
         cache[0]
-        replacementallocation(cache, 1)
-        @test replacementallocation(cache, 2) == 0
-        @test replacementallocation(cache, 2) == 0
+        request_allocations(cache, 1)
+        @test request_allocations(cache, 2) == 0
+        @test request_allocations(cache, 2) == 0
         @test cache[3] === value
     end
 end
@@ -238,7 +233,7 @@ end
             calls[] += 1
             if !entered[]
                 entered[] = true
-                return conversion ? TreeMemoizedConversion(nested) : nested()
+                return conversion ? TestConversion(nested) : nested()
             end
             return 7
         end

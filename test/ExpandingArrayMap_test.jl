@@ -228,7 +228,6 @@ end
     @test isready(cache,lower) && JA.entry(cache,(1,)) === entry
 end
 
-expanding_lru_allocations(cache,key) = @allocated cache[key...]
 
 @testset "Expanding LRU matrix requests allocate only on growth" begin
     value = ones(4,4)
@@ -236,12 +235,12 @@ expanding_lru_allocations(cache,key) = @allocated cache[key...]
     warmup = make()
     keys = ((1,2), (2,1), (3,2), (3,2))
     for key in keys
-        expanding_lru_allocations(warmup,key)
+        request_allocations(warmup,key)
     end
     cache = make()
     entries = copy(cache.eviction.entries)
     for key in keys
-        @test expanding_lru_allocations(cache,key) == 0
+        @test request_allocations(cache,key) == 0
         @test any(entry -> JA.entry(cache,key) === entry, entries)
     end
     @test cache.eviction.count == 2 && !isready(cache,1,2)
