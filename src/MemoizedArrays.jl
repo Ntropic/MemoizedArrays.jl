@@ -4,11 +4,6 @@
 
 module MemoizedArrays
 
-"""
-    VT{N,T} = Union{AbstractVector{T},NTuple{N,T}}
-
-An abstract vector with element type `T`, or a length-`N` tuple of elements of type `T`.
-"""
 const VT{N,T} = Union{AbstractVector{T},NTuple{N,T}}
 
 @inline as_tuple(x::Tuple{Vararg{Any,N}}, ::Val{N}) where N = x
@@ -28,13 +23,12 @@ macro astuple(N, names...)
     return Expr(:block, (:($(esc(name)) = as_tuple($(esc(name)), Val($(esc(N))))) for name in names)...)
 end
 
-export AbstractMemoizedArray, MemoizedArray, LRUMemoizedArray, generate!
+export MemoizedArray, LRUMemoizedArray, generate!
 export getready, unbound, isunbound, queue_handle, queue_handles, with_queue
 export ArrayMap, ExpandingArrayMap, DictMap, RadixMap, SubtreeRadixMap
 
 abstract type MapConfig{V} end
 
-"""Cache interface parameterized by value type, dimension count and map type."""
 abstract type AbstractMemoizedArray{ValueType,N,M} <: AbstractArray{ValueType,N} end
 
 abstract type SparseMap{T,N} end

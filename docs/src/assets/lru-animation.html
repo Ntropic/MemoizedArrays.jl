@@ -9,7 +9,7 @@
 html, body { margin:0; background:transparent !important; }
 body { color:var(--ink); font:14px system-ui,sans-serif; }
 main { display:flow-root; max-width:660px; margin:auto; padding:8px 0; }
-.controls { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+.controls { display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-top:12px; }
 button { font:inherit; color:inherit; background:transparent; border:1px solid currentColor; border-radius:4px; padding:3px 9px; cursor:pointer; }
 button:disabled { opacity:.4; cursor:default; }
 progress { flex:1; min-width:80px; height:6px; accent-color:var(--active); }
@@ -28,7 +28,6 @@ path, line { fill:none; stroke:var(--active); stroke-width:1.5; }
 @media(prefers-reduced-motion:reduce) { .ref { transition:none; } }
 </style>
 <main>
-<div class="controls"><button id="back" aria-label="Previous step">←</button><button id="play">Play</button><button id="next" aria-label="Next step">→</button><button id="reset">Reset</button><progress id="progress" value="0" max="1" aria-label="Animation progress"></progress><span id="position"></span></div>
 <svg viewBox="0 0 660 275" role="img" aria-label="Map slots, entry detail and two LRU queues">
 <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10" style="fill:var(--active);stroke:none"/></marker></defs>
 <text x="74" y="22">Map slots</text><g id="map"></g>
@@ -38,6 +37,7 @@ path, line { fill:none; stroke:var(--active); stroke-width:1.5; }
 <text x="84" y="248">oldest → newest</text><text x="244" y="248">oldest → newest</text>
 <g id="logic"></g>
 </svg>
+<div class="controls"><button id="back" aria-label="Previous step">←</button><button id="play">Play</button><button id="next" aria-label="Next step">→</button><button id="reset">Reset</button><progress id="progress" value="0" max="1" aria-label="Animation progress"></progress><span id="position"></span></div>
 </main>
 <script>
 const ns='http://www.w3.org/2000/svg';
