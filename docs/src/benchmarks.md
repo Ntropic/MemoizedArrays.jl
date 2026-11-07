@@ -182,3 +182,7 @@ Recorded runs: Julia 1.13.0, Ryzen 9 7950X, 2026-10-09, 15 rotated rounds.
 Linux affinity: `QUEUE_PIN=true QUEUE_CPU_OFFSET=8 QUEUE_PRODUCER_CPU=0` puts callers on
 physical cores 8–15 and the coordinator on core 0. Calls start against a shared deadline;
 the harness reports overlap, start skew and interquartile spread.
+
+For serial tree slices and views, run `julia --project=. benchmark/slices.jl`.
+It reports microseconds per call and allocated bytes for iteration, copying, reductions and
+mapping, using small, large, narrow and strided selections with 8×8 leaves.

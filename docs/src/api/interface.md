@@ -4,8 +4,8 @@
 CurrentModule = MemoizedArrays
 ```
 
-Use coordinate indexing, `CartesianIndex`, slices and views; multidimensional linear indexing
-is unsupported. See [indexing and generation](../examples.md#Indexing-views-and-generation).
+Supports integer coordinates, `CartesianIndex`, ranges, index vectors, `:` slices and views.
+Views are lazy and share the parent cache; rectangular serial tree views retain bounded subtree shortcuts.
 
 ## Readiness and generated values
 

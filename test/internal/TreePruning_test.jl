@@ -219,3 +219,340 @@ end
         @test treecounts(cache.map) == (0, 1)
     end
 end
+
+@testset "Slice leaf reuse across generation and eviction" begin
+    for Map in (RadixMap, SubtreeRadixMap), C in (MemoizedArray, LRUMemoizedArray), width in (2, 4)
+        config = Map{Int}((-32:32, -8:8); block_shape=(width, width))
+        make(log) = C === MemoizedArray ? C((i, j) -> (push!(log, (i, j)); i + 10j), config) :
+            C((i, j) -> (push!(log, (i, j)); i + 10j), config; capacity=2)
+        calls, scalarcalls = Tuple{Int,Int}[], Tuple{Int,Int}[]
+        cache, scalar = make(calls), make(scalarcalls)
+        for rows in (-7:9, -32:16:32, [0, 1, 16, 0, -16, 1], 1:0)
+            empty!(calls); empty!(scalarcalls)
+            expected = [scalar[i, j] for i in rows, j in -2:2]
+            @test cache[rows, -2:2] == expected
+            @test calls == scalarcalls
+            @test [isready(cache, i, j) for i in -32:32, j in -8:8] ==
+                  [isready(scalar, i, j) for i in -32:32, j in -8:8]
+            @test copy(view(cache, rows, -2:2)) == expected
+        end
+    end
+    for Map in (RadixMap, SubtreeRadixMap), width in (2, 4)
+        # Generating coordinate 1 evicts and prunes the leaf remembered at coordinate 0.
+        cache = LRUMemoizedArray(Map{Int}(unbound(1); block_shape=(width,)); capacity=1) do i
+            i == 1 && cache[100]
+            i
+        end
+        @test cache[0:2] == [0, 1, 2]
+        @test cache[0:2] == [0, 1, 2]
+        @test isready(cache, 2)
+        @test !isready(cache, 1)
+    end
+end
+
+@testset "Bounded slice traversal preserves ordered cache effects" begin
+    for Map in (RadixMap, SubtreeRadixMap), C in (MemoizedArray, LRUMemoizedArray)
+        config = Map{Int}(unbound(2); block_shape=(8,8))
+        make(log) = C === MemoizedArray ? C((i,j)->(push!(log,(i,j)); i+j), config) :
+            C((i,j)->(push!(log,(i,j)); i+j), config;capacity=3)
+        calls, scalarcalls = Tuple{Int,Int}[], Tuple{Int,Int}[]
+        cache, scalar = make(calls), make(scalarcalls)
+        cache[0,0]; scalar[0,0]
+        for _ in 1:2
+            empty!(calls); empty!(scalarcalls)
+            keys = CartesianIndices((-16:15,-16:15))
+            expected = [scalar[key] for key in keys]
+            @test copy(view(cache,-16:15,-16:15)) == expected
+            @test calls == scalarcalls
+            @test [isready(cache,key) for key in keys] == [isready(scalar,key) for key in keys]
+        end
+    end
+end
+
+@testset "Warm slice copies preserve pins and eviction order" begin
+    for Map in (RadixMap, SubtreeRadixMap)
+        cache = LRUMemoizedArray(+,Map{Int}(unbound(2);block_shape=(8,8));capacity=1024)
+        for key in reverse(CartesianIndices((1:32,1:32)))
+            cache[key]
+        end
+        cache[1,1] = 777
+        cache[1000,1000]
+        expected = [i+j for i in 1:32,j in 1:32]
+        expected[1,1] = 777
+        @test copy(view(cache,1:32,1:32)) == expected
+        cache[1001,1000]
+        @test !isready(cache,1000,1000) && isready(cache,2,1)
+        cache[1002,1000]
+        @test !isready(cache,2,1) && cache[1,1] == 777
+    end
+end
+
+@testset "Slice destination conversion can replace collected leaves" begin
+    for Map in (RadixMap, SubtreeRadixMap)
+        owner = Ref{Any}()
+        generator = (i,j) -> TestConversion(() -> begin
+            if (i,j) == (1,1)
+                for k in 10_000:11_023
+                    owner[][k,10_000]
+                end
+                owner[][2,1] = TestConversion(() -> 999)
+            end
+            i+j
+        end)
+        cache = LRUMemoizedArray(generator,Map{TestConversion}(unbound(2);block_shape=(8,8));capacity=1024)
+        owner[] = cache
+        for key in CartesianIndices((1:32,1:32))
+            cache[key]
+        end
+        expected = [i+j for i in 1:32,j in 1:32]
+        expected[2,1] = 999
+        @test copyto!(zeros(Int,32,32),view(cache,1:32,1:32)) == expected
+    end
+end
+
+@testset "Slice copies preserve boundary and multidimensional coordinates" begin
+    for Map in (RadixMap, SubtreeRadixMap), (ranges,block) in (
+            ((typemax(Int)-1023:typemax(Int),),(8,)),
+            ((1:16,-3:4,5:12),(4,8,2)),
+            ((1:32,4:4,-16:15),(4,8,2)))
+        cache = MemoizedArray((key...) -> sum(key),Map{Int}(unbound(length(ranges));block_shape=block))
+        keys = CartesianIndices(ranges)
+        expected = [cache[key] for key in keys]
+        @test cache[ranges...] == expected
+    end
+end
+
+@testset "Bounded tree views remain live across pruning" begin
+    for Map in (RadixMap, SubtreeRadixMap), C in (MemoizedArray, LRUMemoizedArray)
+        calls = Ref(0)
+        config = Map{Int}((-128:128,-128:128); block_shape=(8,8))
+        generator = (i,j) -> (calls[] += 1; i + 10j)
+        cache = C === MemoizedArray ? C(generator,config) : C(generator,config;capacity=2)
+        selected = view(cache,-2:2,-3:3)
+        @test selected isa JA.TreeView
+        @test calls[] == 0
+        @test parent(selected) === cache
+        @test parentindices(selected) == (-2:2,-3:3)
+        @test size(selected) == (5,7)
+        @test selected[1,1] == -32
+        @test selected[CartesianIndex(1,1)] == -32
+        @test_throws BoundsError selected[0,1]
+        @test_throws BoundsError selected[6,1]
+        for _ in 1:3
+            cache[100,100]; cache[-100,-100]
+            @test selected[1,1] == -32
+            @test isready(cache,-2,-3)
+        end
+        cache[-2,-3] = 42
+        @test selected[1,1] == 42
+        selected[2,2] = 43
+        @test cache[-1,-2] == 43
+        nested = view(selected,1:2,1:2)
+        @test parent(nested) === cache
+        @test copy(nested) == [42 -22; -31 43]
+        full = view(cache,:,:)
+        @test axes(full) == axes(view(full.selection,:,:))
+        @test full[-2,-3] == 42
+        @test sum(nested) == sum(copy(nested))
+        column = view(selected,:,1)
+        @test column isa JA.TreeView
+        @test column[1] == 42
+        @test copy(column) == copy(selected)[:,1]
+        @test view(selected,1,1)[] == 42
+        @test view(cache,Int32(-2):Int32(0),Int32(-3):Int32(0))[1,1] == 42
+    end
+    for Map in (RadixMap, SubtreeRadixMap)
+        cache = LRUMemoizedArray(Map{Int}(unbound(1);block_shape=(8,));capacity=1) do i
+            i == 1 && cache[100]
+            i
+        end
+        selected = view(cache,0:3)
+        @test collect(selected) == [0,1,2,3]
+        @test collect(selected) == [0,1,2,3]
+    end
+end
+
+@testset "Tree view iteration preserves live values and access order" begin
+    values(view) = reshape([identity(value) for value in view], size(view))
+    for Map in (RadixMap, SubtreeRadixMap), C in (MemoizedArray, LRUMemoizedArray)
+        config = Map{Int}(unbound(2); block_shape=(8,8))
+        calls, expectedcalls = Tuple{Int,Int}[], Tuple{Int,Int}[]
+        make(log) = C === MemoizedArray ? C((i,j) -> (push!(log,(i,j)); i+10j),config) :
+            C((i,j) -> (push!(log,(i,j)); i+10j),config;capacity=3)
+        cache, scalar = make(calls), make(expectedcalls)
+        selected = view(cache,10:73,-16:-1)
+        @test isempty(calls)
+        for _ in 1:2
+            empty!(calls); empty!(expectedcalls)
+            expected = [scalar[k] for k in CartesianIndices((10:73,-16:-1))]
+            @test values(selected) == expected
+            @test calls == expectedcalls
+            @test [isready(cache,k) for k in CartesianIndices((10:73,-16:-1))] ==
+                [isready(scalar,k) for k in CartesianIndices((10:73,-16:-1))]
+        end
+        # Pause two independent traversals, change the next value, and evict other leaves.
+        _, firststate = iterate(selected)
+        _, secondstate = iterate(selected)
+        cache[11,-16] = 123
+        cache[1000,1000]
+        @test iterate(selected,firststate)[1] == 123
+        @test iterate(selected,secondstate)[1] == 123
+        @test values(view(cache,1:0,1:2)) == zeros(Int,0,2)
+        @test values(view(cache,11,-16))[] == 123
+        @test values(view(cache,1:1024,-16)) == [cache[i,-16] for i in 1:1024]
+        @test values(view(cache,11,-1024:-1)) == [cache[11,j] for j in -1024:-1]
+        hot = C === MemoizedArray ? C(+,config) : C(+,config;capacity=1024)
+        hot[10:73,-16:-1]
+        selected = view(hot,10:73,-16:-1)
+        @test values(selected) == [i+j for i in 10:73,j in -16:-1]
+        _, state = iterate(selected)
+        @test state[1].leaves !== nothing
+        hot[11,-16] = 123
+        value, state = iterate(selected,state)
+        @test value == 123
+        for i in 1000:3048
+            hot[i,1000]
+        end
+        @test iterate(selected,state)[1] == -4
+        # Relative leaf coordinates also cover unequal leaf widths and dropped dimensions.
+        for indices in ((typemin(Int)+13,-8:23,-16:15),
+                        (typemax(Int)-31:typemax(Int),9,-16:15))
+            config3 = Map{Int}(unbound(3);block_shape=(4,8,2))
+            cache3 = C === MemoizedArray ? C(+,config3) : C(+,config3;capacity=1024)
+            expected = cache3[indices...]
+            selected3 = view(cache3,indices...)
+            @test map(identity,selected3) == expected
+            visited = Int[]
+            foreach(value -> push!(visited,value),selected3)
+            @test visited == vec(expected)
+        end
+    end
+    for Map in (RadixMap, SubtreeRadixMap)
+        cache = LRUMemoizedArray(Map{Int}(unbound(2);block_shape=(8,8));capacity=2) do i,j
+            isodd(i) && cache[10000,10000]
+            i+j
+        end
+        @test values(view(cache,1:64,1:16)) == [i+j for i in 1:64,j in 1:16]
+        cache3 = MemoizedArray(+,Map{Int}(unbound(3);block_shape=(8,8,8)))
+        @test values(view(cache3,1:16,1:8,1:8)) == [i+j+k for i in 1:16,j in 1:8,k in 1:8]
+        # A huge finite view must not allocate a table proportional to its extent.
+        @test iterate(view(cache3,1:10^9,1:2,1:2))[1] == 3
+    end
+end
+
+@testset "Tree view mapping preserves destination and live-source behavior" begin
+    for Map in (RadixMap, SubtreeRadixMap), C in (MemoizedArray, LRUMemoizedArray)
+        config = Map{Int}(unbound(3);block_shape=(4,8,2))
+        cache = C === MemoizedArray ? C(+,config) : C(+,config;capacity=1024)
+        expected = cache[1:32,4,1:32]
+        selected = view(cache,1:32,4,1:32)
+        dest = fill(-7,1026)
+        @test map!(abs2,dest,selected) === dest
+        @test dest == vcat(vec(abs2.(expected)),[-7,-7])
+        @test map!(-,zeros(Int,3),selected) == -vec(expected)[1:3]
+        @test isempty(map!(error,Int[],selected))
+        checked = @inline value -> begin
+            @boundscheck throw(BoundsError())
+            value
+        end
+        @test_throws BoundsError map!(checked,dest,selected)
+
+        for conversion in (false,true)
+            config = Map{Int}(unbound(2);block_shape=(8,8))
+            cache = C === MemoizedArray ? C(+,config) : C(+,config;capacity=1024)
+            cache[1:32,1:32]
+            first = Ref(true)
+            mutate(value) = begin
+                if first[]
+                    first[] = false
+                    for k in 10_000:11_023
+                        cache[k,10_000]
+                    end
+                    cache[2,1] = 999
+                end
+                2value
+            end
+            f = conversion ? (value -> TestConversion(() -> mutate(value))) : mutate
+            expected = [2(i+j) for i in 1:32,j in 1:32]
+            expected[2,1] = 1998
+            @test map!(f,zeros(Int,32,32),view(cache,1:32,1:32)) == expected
+        end
+    end
+end
+
+@testset "Tree view reductions preserve promotion and evaluation order" begin
+    for Map in (RadixMap, SubtreeRadixMap), V in (Bool,Int8,UInt8,Float64)
+        cache = MemoizedArray((i,j) -> V(isodd(i+j)),Map{V}(unbound(2);block_shape=(8,8)))
+        expected = cache[1:32,1:32]
+        selected = view(cache,1:32,1:32)
+        @test sum(selected) === mapfoldl(identity,Base.add_sum,expected)
+        @test sum(x for x in selected if false) == 0
+        @test sum(x for x in selected if x > 0) === sum(selected)
+        @test sum(abs2,selected;init=2.0) === mapfoldl(abs2,Base.add_sum,expected;init=2.0)
+        ordered(a,b) = mod(3a+b,257)
+        @test mapfoldl(Int,ordered,selected;init=7) == mapfoldl(Int,ordered,expected;init=7)
+        @test sum(selected;dims=1) == sum(expected;dims=1)
+    end
+    for Map in (RadixMap, SubtreeRadixMap)
+        cache = MemoizedArray((i,j) -> (1e16,1.0,-1e16,1.0)[mod1(i,4)],
+            Map{Float64}(unbound(2);block_shape=(8,8)))
+        cache[1:32,1:32]
+        @test sum(view(cache,1:32,1:32)) === 1.0
+    end
+    for Map in (RadixMap, SubtreeRadixMap), C in (MemoizedArray, LRUMemoizedArray)
+        function scenario(optimized)
+            events = Tuple{Symbol,Int,Int}[]
+            generator = (i,j) -> (push!(events,(:generate,i,j));i+10j)
+            config = Map{Int}(unbound(2);block_shape=(8,8))
+            cache = C === MemoizedArray ? C(generator,config) : C(generator,config;capacity=1024)
+            cache[1:32,1:32]
+            empty!(events)
+            first = Ref(true)
+            f = value -> begin
+                push!(events,(:map,value,0))
+                if first[]
+                    first[] = false
+                    for k in 10_000:11_023
+                        cache[k,10_000]
+                    end
+                    cache[2,1] = 999
+                end
+                value
+            end
+            op = Base.MappingRF(f,Base.BottomRF(+))
+            selected = view(cache,1:32,1:32)
+            result = optimized ? mapfoldl(f,+,selected;init=7) :
+                invoke(Base._foldl_impl,Tuple{Any,Any,Any},op,7,selected)
+            return result,events
+        end
+        @test scenario(true) == scenario(false)
+    end
+end
+
+@testset "Tree view entry points cover the entire selection" begin
+    for Map in (RadixMap, SubtreeRadixMap), C in (MemoizedArray, LRUMemoizedArray), center in (-0.5,0.5)
+        config = Map{Int}(unbound(2);block_shape=(8,8),center)
+        cache = C === MemoizedArray ? C(+,config) : C(+,config;capacity=8192)
+        cache[-10^9,10^9]; cache[10^9,-10^9]
+        for (rows,cols) in ((-16:15,-16:15),(1:32,1:32),(10001:10032,-32:-1))
+            cache[rows,cols]
+            selected = view(cache,rows,cols)
+            node = JA.view_root(cache.map,selected.low,selected.high)
+            @test JA.tree_matches(cache.map,selected.low,JA.node_prefix(node),JA.node_level(node))
+            @test JA.tree_matches(cache.map,selected.high,JA.node_prefix(node),JA.node_level(node))
+            step = iterate(selected)
+            values = Int[]
+            used_table = true
+            for key in CartesianIndices((rows,cols))
+                value, state = step
+                push!(values,value)
+                # A warm rectangle should stay on the leaf table throughout the pass.
+                used_table &= state[1].leaves !== nothing
+                step = iterate(selected,state)
+            end
+            @test values == vec([i+j for i in rows,j in cols])
+            @test used_table
+            @test step === nothing
+        end
+    end
+end

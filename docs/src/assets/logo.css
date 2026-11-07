@@ -1,0 +1,9 @@
+.package-title img {
+    width: 364px;
+    max-width: 100%;
+    height: auto;
+}
+.package-title .package-logo-light { display: block; }
+.package-title .package-logo-dark { display: none; }
+html.theme--documenter-dark .package-title .package-logo-light { display: none; }
+html.theme--documenter-dark .package-title .package-logo-dark { display: block; }

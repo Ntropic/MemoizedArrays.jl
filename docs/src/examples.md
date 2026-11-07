@@ -26,6 +26,8 @@ values[1] = 1;
 values[8]
 ```
 
+For performance-sensitive nested generators, consider capturing dependencies through a concretely typed `Ref` and accessing them with `dependency_ref[]`. Alternatively, wrap a generator with `generator_ref = Ref(generator)` and pass `(indices...) -> generator_ref[](indices...)` to the cache constructor. This can reduce allocations in some dynamically dispatched lookup paths; benchmark warmed lookups, and avoid `Ref{Any}`, which loses type information.
+
 ## LRUMemoizedArray
 `LRUMemoizedArray` retains at most `capacity` generated values, to balance generation cost with memory utilisation. 
 
@@ -95,27 +97,13 @@ values = LRUMemoizedArray(identity, DictMap{Int}(unbound(1)); capacity=512);
 values[-20]
 ```
 
-## Indexing, views and generation
-
-```@example indexing
-using MemoizedArrays # hide
-values = MemoizedArray(tuple, ArrayMap{Tuple{Int,Int}}((-3:3, 0:4)));
-view(values, -2:2, 0:3)[1, 1]
-```
-
-```@example indexing
-generate!(values, ((-3, 4), (3, 0))) === values
-```
-
-Slices return ordinary arrays. A view generates only when it is read.
-
 ## Concurrent MemoizedArray
 
-Start Julia with, for example, `julia --threads=8`.
+Set `concurrent=true` to share a cache between tasks.
 
 ```julia
 values = MemoizedArray(i -> fill(Float64(i), 4, 4),
-                  ArrayMap{Matrix{Float64}}((1000,)); concurrent=true)
+    ArrayMap{Matrix{Float64}}((1000,)); concurrent=true)
 tasks = [Threads.@spawn values[7] for _ in 1:4]
 fetch.(tasks)
 ```
@@ -124,7 +112,9 @@ Concurrent requests for the same missing coordinate generate it once; other call
 
 ## Concurrent LRUMemoizedArray
 
-The entry stores both the value and a `last_access` hint. Queues hold references to it.
+Concurrent LRU access uses one queue per active caller. For example, with
+`julia --threads=n`, use `queues=n` and a capacity divisible by `n`.
+Each queue tracks recent accesses through references to shared entries.
 
 ```@raw html
 <iframe src="assets/lru-animation.html" title="LRU access and eviction animation"
@@ -132,19 +122,27 @@ The entry stores both the value and a `last_access` hint. Queues hold references
 ```
 
 ```julia
+n = Threads.nthreads(:default)
 values = LRUMemoizedArray(identity, ArrayMap{Int}((1000,));
-                  capacity=512, concurrent=true, queues=8)
+     capacity=128*n, concurrent=true, queues=n)
 handles = queue_handles(values)
-tasks = [Threads.@spawn handles[i][i] for i in eachindex(handles)]
+tasks = [Threads.@spawn sum(handles[q][i] for i in 1:100) for q in 1:n]
 fetch.(tasks)
 ```
 
-Or let the cache claim a queue for one operation:
+Alternatively, start one worker task per thread and use `with_queue` to claim a
+caller once per worker. Reuse that caller across many runs; its queue is released
+when the block finishes:
 
 ```julia
-with_queue(values) do handle
-    handle[1]
-end
+tasks = [
+    Threads.@spawn begin
+        with_queue(values) do caller
+            [sum(caller[i] for i in 1:100) for run in 1:100]
+        end
+    end for _ in 1:n
+]
+fetch.(tasks)
 ```
 
 Use one caller per queue. Do not mix automatic selection with explicit handles concurrently

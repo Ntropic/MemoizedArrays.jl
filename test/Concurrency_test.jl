@@ -1268,3 +1268,27 @@ end
         @test JA.entry(cache, JA.cache_key(cache, (0,))).explicit
     end
 end
+
+@testset "Concurrent tree view readers share generated values" begin
+    for Map in (RadixMap, SubtreeRadixMap), C in (MemoizedArray, LRUMemoizedArray)
+        calls = Threads.Atomic{Int}(0)
+        generator = (i,j) -> (Threads.atomic_add!(calls,1); i+j)
+        config = Map{Int}(unbound(2);block_shape=(8,8))
+        cache = C === MemoizedArray ? C(generator,config;concurrent=true) :
+            C(generator,config;concurrent=true,capacity=128,queues=4)
+        selected = view(cache,1:4,1:4)
+        tasks = map(1:4) do _
+            Threads.@spawn begin
+                if C === LRUMemoizedArray
+                    with_queue(cache) do handle
+                        sum(view(handle,1:4,1:4))
+                    end
+                else
+                    sum(selected)
+                end
+            end
+        end
+        @test fetch.(tasks) == fill(80,4)
+        @test calls[] == 16
+    end
+end

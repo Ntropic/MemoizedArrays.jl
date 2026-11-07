@@ -336,6 +336,25 @@ end
 @inline map_slot(store::TreeMap, key, encoded) = tree_find(store, encoded, Val(false))
 @inline prepare(store::TreeMap, key, encoded) = tree_find(store, encoded, Val(true))
 
+# Resume ordered slice traversal at the nearest ancestor covering the next coordinate.
+slice_ancestors(::TreeMap{T,N}) where {T,N} = TreeBranch{T,N}[]
+@inline prepare_slice!(::Nothing, store, key, routing, encoded) = prepare(store, key, routing)
+@inline function prepare_slice!(path::Vector{TreeBranch{T,N}}, store::TreeMap{T,N}, key, routing, encoded) where {T,N}
+    while !isempty(path) && !tree_matches(store, encoded, last(path).prefix, last(path).level)
+        pop!(path)
+    end
+    node = isempty(path) ? slot_entry(root_link(store)) : pop!(path)
+    while node !== store.roots.empty && tree_matches(store, encoded, node_prefix(node), node_level(node))
+        if node isa TreeLeaf{T,N}
+            return node, (nothing, nothing, tree_address(store, encoded, 0))
+        end
+        branch = node::TreeBranch{T,N}
+        push!(path, branch)
+        node = slot_entry(map_slot(branch.children, tree_address(store, encoded, branch.level), nothing))
+    end
+    return prepare(store, key, routing)
+end
+
 @inline map_slot(store::SubtreeRadixMap{T,N}, key, route::Tuple{NTuple{N,UInt},Int}) where {T,N} =
     tree_find(store, route[1], route[2], Val(false))
 @inline prepare(store::SubtreeRadixMap{T,N}, key, route::Tuple{NTuple{N,UInt},Int}) where {T,N} =
@@ -636,4 +655,76 @@ end
         end
     end
     return nothing
+end
+
+# Gather intersecting leaves without generating values or touching LRU order.
+function gather_slice_leaves!(table, node::TreeNode{T,N}, store, low, high, origin) where {T,N}
+    node === store.roots.empty && return
+    level = node_level(node)
+    block = block_shape(store)
+    prefix = node_prefix(node)
+    lo = ntuple(i -> max(low[i], prefix[i]), Val(N))
+    hi = ntuple(Val(N)) do i
+        bits = tree_bits(block, i, level)
+        mask = bits >= 8sizeof(UInt) ? typemax(UInt) : (UInt(1) << bits) - UInt(1)
+        min(high[i], prefix[i] | mask)
+    end
+    any(i -> lo[i] > hi[i], 1:N) && return
+    if node isa TreeLeaf{T,N}
+        index = ntuple(i -> Int((prefix[i] >> trailing_zeros(block[i])) - origin[i]) + 1, Val(N))
+        @inbounds table[index...] = node
+        return
+    end
+    branch = node::TreeBranch{T,N}
+    children = ntuple(Val(N)) do i
+        shift = level * trailing_zeros(block[i])
+        mask = UInt(block[i] - 1)
+        Int((lo[i] >> shift) & mask) + 1:Int((hi[i] >> shift) & mask) + 1
+    end
+    for index in CartesianIndices(children)
+        # Concrete node alternatives keep recursive calls from boxing coordinates and the map.
+        child = slot_entry(map_slot(branch.children, Tuple(index), nothing))::Union{TreeBranch{T,N},TreeLeaf{T,N}}
+        gather_slice_leaves!(table, child, store, lo, hi, origin)
+    end
+end
+
+# A bounded view owns a node reference, never a parent link that insertion can replace.
+function view_root(store::TreeMap{T,N}, low, high) where {T,N}
+    node = slot_entry(root_link(store))::Union{TreeBranch{T,N},TreeLeaf{T,N}}
+    if store isa SubtreeRadixMap
+        depth = min(max(root_index(store, low), root_index(store, high)), length(store.roots.reference.mem))
+        shortcut = slot_entry(map_slot(store.roots, depth, nothing))::Union{TreeBranch{T,N},TreeLeaf{T,N}}
+        if shortcut !== store.roots.empty &&
+                tree_matches(store, low, node_prefix(shortcut), node_level(shortcut)) &&
+                tree_matches(store, high, node_prefix(shortcut), node_level(shortcut))
+            node = shortcut
+        end
+    end
+    while node isa TreeBranch{T,N}
+        address = tree_address(store, low, node.level)
+        address == tree_address(store, high, node.level) || break
+        child = slot_entry(map_slot(node.children, address, nothing))::Union{TreeBranch{T,N},TreeLeaf{T,N}}
+        if child === store.roots.empty ||
+                !tree_matches(store, low, node_prefix(child), node_level(child)) ||
+                !tree_matches(store, high, node_prefix(child), node_level(child))
+            break
+        end
+        node = child
+    end
+    return node
+end
+
+@inline live_view_root(node::TreeLeaf) = node.used > 0
+@inline live_view_root(node::TreeBranch) = node.used >= 2
+
+@inline function view_lookup(store::TreeMap{T,N}, key, routing, encoded, node) where {T,N}
+    while node !== store.roots.empty && tree_matches(store, encoded, node_prefix(node), node_level(node))
+        if node isa TreeLeaf{T,N}
+            return key, routing, node, (nothing, nothing, tree_address(store, encoded, 0))
+        end
+        branch = node::TreeBranch{T,N}
+        node = slot_entry(map_slot(branch.children, tree_address(store, encoded, branch.level), nothing))
+    end
+    leaf, hint = prepare(store, key, routing)
+    return key, routing, leaf, hint
 end

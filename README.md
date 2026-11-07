@@ -1,4 +1,7 @@
-# MemoizedArrays.jl
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/src/assets/logo-dark.svg">
+  <img alt="MemoizedArrays.jl" src="docs/src/assets/logo-light.svg" width="364">
+</picture>
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue)](LICENSE)
 [![Julia 1.13+](https://img.shields.io/badge/Julia-1.13%2B-9558B2)](https://julialang.org/downloads/)
@@ -52,12 +55,16 @@ Each array combines two components:
 
 ### LRU retention
 
+`LRUMemoizedArray` limits retained values by evicting least recently used entries and regenerating them when needed.
+
 ```julia
 retained = LRUMemoizedArray(value_at, ArrayMap{Float64}((100, 100)); capacity=512)
 retained[2, 3]  # Keep at most 512 generated values.
 ```
 
 ### Radix map
+
+`RadixMap` stores sparse coordinates in a tree that allocates storage along requested paths.
 
 ```julia
 sparse = MemoizedArray(value_at, RadixMap{Float64}(unbound(2); block_shape=(8, 8)))
@@ -66,24 +73,31 @@ sparse[-200, 300]  # Allocate storage only along requested tree paths.
 
 ### Concurrent access
 
-Start Julia with `julia --threads=4`.
+Set `concurrent=true` and provide one queue per active caller. For example, with
+`julia --threads=n`, use `queues=n` and a capacity divisible by `n`:
 
 ```julia
+n = Threads.nthreads(:default)
 shared = LRUMemoizedArray(value_at, ArrayMap{Float64}((100, 100));
-                  capacity=512, concurrent=true, queues=4)
+    capacity=128*n, concurrent=true, queues=n)
 handles = queue_handles(shared)
-tasks = [Threads.@spawn handles[q][q, 3] for q in 1:4]
+tasks = [Threads.@spawn sum(handles[q][i, 3] for i in 1:100) for q in 1:n]
 fetch.(tasks)
 ```
-For automatic scoped assignment, use `with_queue`:
+
+Alternatively, use `with_queue` to give each worker task a caller that it reuses
+across many runs. The queue is claimed once and released when the block finishes:
 
 ```julia
-with_queue(shared) do caller
-    caller[1, 3]
-end
+tasks = [
+    Threads.@spawn begin
+        with_queue(shared) do caller
+            [sum(caller[i, 3] for i in 1:100) for run in 1:100]
+        end
+    end for _ in 1:n
+]
+fetch.(tasks)
 ```
-Do not mix automatic selection with explicit handles concurrently on the same cache.
-
 ## Author
 
 Michael Schilling

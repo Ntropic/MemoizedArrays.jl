@@ -1,4 +1,9 @@
-# MemoizedArrays.jl
+```@raw html
+<h1 class="package-title">
+  <img class="package-logo-light" src="assets/logo-light.svg" alt="MemoizedArrays.jl" width="364">
+  <img class="package-logo-dark" src="assets/logo-dark.svg" alt="MemoizedArrays.jl" width="364">
+</h1>
+```
 
 ```@meta
 DocTestSetup = :(using MemoizedArrays)
