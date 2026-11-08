@@ -1,9 +1,4 @@
-function read_workload(rng, keys)
-    readpattern == "cycle" && return keys, readrepeats
-    @assert readpattern == "varying"
-    @assert readrepeats % 16 == 0
-    return [rand(rng, keyset, 16length(keyset)) for keyset in keys], readrepeats ÷ 16
-end
+read_workload(keys) = keys, readrepeats
 
 # Bring existing empty slots and preallocated LRU memory onto the requesting core.
 # Dict records are allocated during timed generation; setup does not reserve keys.
@@ -101,7 +96,7 @@ function sample(name, callers, operation, inboxes, outboxes)
     end
     repeats = operation === :read ? readrepeats : 1
     if operation === :read
-        keys, repeats = read_workload(rng, keys)
+        keys, repeats = read_workload(keys)
     end
     prepare = w -> if operation === :generate
         ()->touch_empty!(readers[w],keys[w])
@@ -260,7 +255,7 @@ function tree_sample(name, callers, operation, inboxes, outboxes)
         end
     end
     if isread
-        keys, repeats = read_workload(rng, keys)
+        keys, repeats = read_workload(keys)
     end
     prepare = w -> !isread ? () -> begin
         tree_touch_queue!(readers[w])
@@ -278,4 +273,3 @@ function tree_sample(name, callers, operation, inboxes, outboxes)
     end
     return result
 end
-

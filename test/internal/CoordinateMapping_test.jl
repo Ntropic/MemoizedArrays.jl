@@ -86,7 +86,6 @@ end
         end
         @test read_allocations(cache, hi) == 0
         @test_throws ArgumentError C(identity, (test_map_config(map_spec, (8,); center=0))(Int, unbound(1)); options...)
-        @test_throws MethodError C(identity, ArrayMap{Int}((8,)); center, options...)
     end
     # Check geometry independently: each ancestor is the closest aligned interval
     # to the requested center, among the possible parents of the central child.

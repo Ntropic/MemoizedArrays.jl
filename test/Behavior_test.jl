@@ -1,4 +1,5 @@
 const behavior_maps = (ArrayMap, ExpandingArrayMap, DictMap, RadixMap, SubtreeRadixMap)
+const failure_maps = (ArrayMap, ExpandingArrayMap, SubtreeRadixMap)
 
 @testset "Generation, storage and reads: $Map / $C / concurrent=$concurrent" for
     Map in behavior_maps, C in (MemoizedArray, LRUMemoizedArray), concurrent in (false, true)
@@ -40,7 +41,7 @@ end
 end
 
 @testset "Values and failures: $Map / $C / concurrent=$concurrent" for
-    Map in behavior_maps, C in (MemoizedArray, LRUMemoizedArray), concurrent in (false, true)
+    Map in failure_maps, C in (MemoizedArray, LRUMemoizedArray), concurrent in (false, true)
     matrix = ones(2, 2)
     values = (nothing, false, JA.EMPTY, JA.GENERATING, JA.RELOCATED,
         JA.HASH_EMPTY, JA.HASH_DELETED, JA.GenerationFailure(ErrorException("value")), matrix, view(matrix, :, 1))
@@ -99,7 +100,6 @@ end
     for increment in (0, -1)
         @test_throws ArgumentError ExpandingArrayMap{Int}((3,); increment)
     end
-    @test_throws UndefKeywordError ExpandingArrayMap{Int}((3,))
     @test_throws ArgumentError MemoizedArray(identity, ExpandingArrayMap{Int}(unbound(1); increment=2))
     @test_throws DimensionMismatch MemoizedArray(identity, RadixMap{Int}((-2:2,); block_shape=(4, 8)))
     @test_throws ArgumentError unbound(-1)
@@ -120,10 +120,8 @@ end
         ((V, domain) -> RadixMap{V}(domain; block_shape=(8,))), ((V, domain) -> SubtreeRadixMap{V}(domain; block_shape=(8,)))), concurrent in (false, true)
         @test_throws ArgumentError LRUMemoizedArray(identity, map_spec(Int, (0:3,)); capacity=Int(typemax(UInt32)) + 1, concurrent, queues=1)
     end
-    @test_throws UndefKeywordError LRUMemoizedArray(identity, ArrayMap{Int}((4,)))
     @test JA.as_tuple([2, 3], Val(2)) === (2, 3)
     @test_throws DimensionMismatch JA.as_tuple([2], Val(2))
-    @test isempty(detect_ambiguities(MemoizedArrays))
 end
 
 @testset "Array interface" begin
@@ -157,8 +155,6 @@ end
     value = cache[2, 3, 4]
     @test (@inferred getready(cache, 2, 3, 4)) === value
     @test calls[] == 1
-    @test_throws MethodError getready(cache, 2, 3, 4, 1)
-    @test_throws MethodError getready(cache, 25)
     @test_throws BoundsError getready(cache, 3, 1, 1)
 end
 

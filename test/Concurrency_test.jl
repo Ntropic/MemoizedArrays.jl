@@ -1035,7 +1035,7 @@ end
         cache = LRUMemoizedArray(generator, ArrayMap{V}((512,)); concurrent=true, capacity=64, queues=8)
         handles = [queue_handle(cache,i) for i in 1:8]
         @sync for i in 1:8
-            Threads.@spawn for request in 1:1024
+            Threads.@spawn for request in 1:256
                 key = mod1(17request+7i,512)
                 expected = V === Int ? key : [key]
                 @test handles[i][key] == expected

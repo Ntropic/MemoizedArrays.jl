@@ -37,10 +37,7 @@ function run_case(Map, C, pattern, dims)
     repeats = max(2, min(100, 1_000_000 ÷ prod(dims)))
     for (operation, f, result) in (("iterate view", () -> iterate_view(selected), sum(expected)),
                             ("slice", () -> cache[rows, cols], expected),
-                            ("copy view", () -> copy(selected), expected),
-                            ("copyto!", () -> copyto!(dest, selected), expected),
                             ("sum view", () -> sum(selected), sum(expected)),
-                            ("sum(abs2) view", () -> sum(abs2, selected), sum(abs2, expected)),
                             ("map! view", () -> map!(abs2, dest, selected), abs2.(expected)))
         @assert f() == result
         us, bytes = measure(f; repeats)
@@ -49,8 +46,7 @@ function run_case(Map, C, pattern, dims)
     # Each cold sample uses a fresh cache; construction is outside timing.
     for (operation, cold, result) in (
             ("cold slice", cache -> cache[rows,cols], expected),
-            ("cold sum view", cache -> sum(view(cache,rows,cols)), sum(expected)),
-            ("cold iterate view", cache -> iterate_view(view(cache,rows,cols)), sum(expected)))
+            ("cold sum view", cache -> sum(view(cache,rows,cols)), sum(expected)))
         cold(makecache())
         times = Float64[]
         for _ in 1:9
@@ -68,9 +64,7 @@ if abspath(PROGRAM_FILE) == @__FILE__
     println("# Julia ", VERSION, "; CPU ", Sys.CPU_NAME, "; 8x8 leaves; nine samples; 2–100 warm calls per sample")
     println("map,cache,view_shape,selection,operation,microseconds,bytes")
     for Map in (RadixMap, SubtreeRadixMap), C in (MemoizedArray, LRUMemoizedArray)
-        for dims in ((8,8), (128,64), (1024,256), (4096,1), (1,4096))
-            run_case(Map, C, :contiguous, dims)
-        end
+        run_case(Map, C, :contiguous, (128,64))
         run_case(Map, C, :scattered, (128,64))
     end
 end

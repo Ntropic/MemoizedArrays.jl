@@ -1,17 +1,9 @@
-# Public cache benchmarks; preconfigured matrices and scalar checksum.
-# Run with julia --project=. -t 8 benchmark.jl; set QUEUE_READ_PATTERN=varying for random repeats.
-# Optional Linux affinity: QUEUE_PIN=true QUEUE_CPU_OFFSET=8 QUEUE_PRODUCER_CPU=0.
-# Optional expanding LRU cases: QUEUE_CASES=expanding-lru-serial,expanding-lru.
-# Optional Dict cases: QUEUE_CASES=dict-serial,dict,dict-lru-serial,dict-lru.
-# Tree Memoized cases: array2d-serial,array2d,radix-serial,radix,subtree-serial,subtree.
-# Tree LRU cases: append -lru before the optional -serial suffix.
-# Tree operations: read-central,read-spread,generate-central,generate-existing,generate-structural.
-# Tree LRU also supports evict-central and evict-spread.
+# Overview benchmarks use fixed arrays by default. Select the compact tree comparison
+# documented in docs/src/benchmarks.md when measuring adaptive routing and eviction.
 using MemoizedArrays, Random, Statistics
 const payload = ones(4, 4)
 const rounds = parse(Int, get(ENV, "QUEUE_ROUNDS", "15"))
 const readrepeats = parse(Int, get(ENV, "QUEUE_READ_REPEATS", "512"))
-const readpattern = get(ENV,"QUEUE_READ_PATTERN","cycle")
 const operations = Tuple(Symbol.(split(get(ENV, "QUEUE_OPERATIONS", "read,generate,evict"), ',')))
 const workers = Threads.nthreads()
 const cpu_offset = parse(Int,get(ENV,"QUEUE_CPU_OFFSET","0"))
@@ -94,7 +86,7 @@ function produce(inboxes,outboxes)
     println("Julia ", VERSION, "; ", Sys.CPU_NAME, "; ",workers," persistent workers; ", rounds, " rotated rounds; worker CPUs ",cpu_offset,":",cpu_offset+workers-1,".")
     println("Producer thread=",Threads.threadid()," pool=",Threads.threadpool())
     println("Preconfigured matrices; setup outside timing; aggregate wall ns/request [Q1,Q3].")
-    println("Read pattern: ", readpattern, "; workload definitions: docs/src/benchmarks.md")
+    println("Workload definitions: docs/src/benchmarks.md")
     println("| Case | Operation | Callers | ns/op [Q1,Q3] | Start skew | Overlap |")
     println("|---|---|---:|---:|---:|---:|")
     flush(stdout)

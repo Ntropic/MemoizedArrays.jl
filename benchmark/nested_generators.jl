@@ -187,17 +187,11 @@ function run_case(c, baseline, label, directory)
     u = [exact[2s-1] for s in 1:SEGMENTS]
     q1 = [corrections[s,1] for s in 1:SEGMENTS]
     q2 = [corrections[s,2] for s in 1:SEGMENTS]
-    merged = [factors[s] for s in 1:SEGMENTS]
     operations = (
         ("correction_lookup", s -> real(corrections[s,2][1][1,1])),
-        ("paired_lookups", s -> real(corrections[s,1][1][1,1]+corrections[s,2][1][1,1])),
-        ("merged_lookup", s -> real(factors[s][1,1])),
         ("boxed_binding_lookup", c.captured_lookup),
-        ("fresh_binding_lookup", c.stable_lookup),
         ("evaluate", s -> evaluate!(b,exact,corrections,s,0.37)),
-        ("arithmetic_only", s -> evaluate_pairs!(b,u[s],q1[s],q2[s],0.37)),
-        ("evaluate_merged", s -> evaluate_merged!(b,exact,corrections,factors,s,0.37)),
-        ("merged_arithmetic_only", s -> evaluate_merged_pairs!(b,u[s],q1[s],q2[s],merged[s],0.37)))
+        ("arithmetic_only", s -> evaluate_pairs!(b,u[s],q1[s],q2[s],0.37)))
     for (name, f) in operations
         ns, bytes = measure(f)
         @printf("%s,%s,%.2f,%.2f\n",label,name,ns,bytes)
@@ -231,7 +225,7 @@ function evaluate_reader!(b, readers, exact, corrections, factors, s, t)
 end
 function run_boundaries(c, wrapped, label, directory)
     saved_calls = copy(c.calls)
-    for depth in (0,8,16)
+    for depth in (0,16)
         dependency = c.factors
         for _ in 1:depth
             dependency = dependency_layer(dependency,wrapped)
