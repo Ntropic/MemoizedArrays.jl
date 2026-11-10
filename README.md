@@ -17,11 +17,11 @@
 
 ## Install
 
-Install from source via
+Install with Julia's package manager:
 
 ```julia
 using Pkg
-Pkg.add(url="https://github.com/Ntropic/MemoizedArrays.jl")
+Pkg.add("MemoizedArrays")
 ```
 
 ## Basic usage
